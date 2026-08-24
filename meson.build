@@ -231,6 +231,7 @@ with_gallium_svga = gallium_drivers.contains('svga')
 with_gallium_virgl = gallium_drivers.contains('virgl')
 with_gallium_lima = gallium_drivers.contains('lima')
 with_gallium_zink = gallium_drivers.contains('zink')
+with_gallium_pvrgl = gallium_drivers.contains('pvrgl')
 with_gallium_d3d12 = gallium_drivers.contains('d3d12')
 with_gallium_asahi = gallium_drivers.contains('asahi')
 with_gallium_rocket = gallium_drivers.contains('rocket')
@@ -1045,6 +1046,7 @@ with_driver_using_cl = [
   with_gallium_rusticl,
   with_nouveau_vk, with_imagination_vk,
   with_kosmickrisp_vk,
+  with_gallium_pvrgl,
 ].contains(true)
 
 if get_option('mesa-clc') == 'system'

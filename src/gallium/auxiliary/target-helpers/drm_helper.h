@@ -519,6 +519,23 @@ DRM_DRIVER_DESCRIPTOR(kmsro, kmsro_driconf, ARRAY_SIZE(kmsro_driconf))
 DRM_DRIVER_DESCRIPTOR_STUB(kmsro)
 #endif
 
+#ifdef GALLIUM_PVRGL
+#include "pvrgl/pvrgl_public.h"
+
+static struct pipe_screen *
+pipe_pvrgl_create_screen(int fd, const struct pipe_screen_config *config)
+{
+   struct pipe_screen *screen;
+
+   screen = pvrgl_create_screen(fd);
+   return screen ? debug_screen_wrap(screen) : NULL;
+}
+
+DRM_DRIVER_DESCRIPTOR_ALIAS(pvrgl, powervr, NULL, 0)
+#else
+DRM_DRIVER_DESCRIPTOR_STUB(powervr)
+#endif
+
 /* kmsro should be the last entry in the file. */
 
 #endif /* DRM_HELPER_H */

@@ -48,6 +48,9 @@ endif
 if with_gallium_zink
   renderonly_drivers_c_args += '-DGALLIUM_ZINK'
 endif
+if with_gallium_pvrgl
+  renderonly_drivers_c_args += '-DGALLIUM_PVRGL'
+endif
 
 libpipe_loader_static = static_library(
   'pipe_loader_static',

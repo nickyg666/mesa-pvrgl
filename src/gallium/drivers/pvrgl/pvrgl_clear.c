@@ -1,0 +1,39 @@
+/* pvrgl_clear.c — clear implementation.
+ *
+ * M2: full-surface hardware clear through the transfer queue. The bound
+ * color surface (set via set_framebuffer_state) is cleared by a FILL TQ
+ * job; completion is observed by polling the BO CPU map.
+ */
+#include "pvrgl_clear.h"
+#include "pvrgl_context.h"
+#include "pvrgl_resource.h"
+#include "pvrgl_tq.h"
+
+#include <vulkan/vulkan.h>
+
+#include "util/log.h"
+
+void
+pvrgl_clear(struct pipe_context *pctx, unsigned buffers, unsigned width,
+            uint8_t viewport_scissor,
+            const struct pipe_scissor_state *scissor_state,
+            const union pipe_color_union *color, double depth,
+            unsigned stencil)
+{
+   struct pvrgl_context *ctx = (struct pvrgl_context *)pctx;
+   static bool warned_no_fb = false;
+
+   if (!(buffers & PIPE_CLEAR_COLOR0))
+      return;
+
+   if (!ctx->color_res) {
+      if (!warned_no_fb) {
+         mesa_logw("pvrgl: clear with no bound color surface (ignored)");
+         warned_no_fb = true;
+      }
+      return;
+   }
+
+   pvrgl_tq_clear_surface(ctx->screen, pvrgl_resource(ctx->color_res),
+                          color->f);
+}

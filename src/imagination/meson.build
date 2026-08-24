@@ -11,7 +11,7 @@ inc_imagination = include_directories([
   'include',
 ])
 
-if with_imagination_vk or with_tools.contains('imagination')
+if with_imagination_vk or with_tools.contains('imagination') or with_gallium_pvrgl
   subdir('common')
   subdir('csbgen')
   subdir('pco')

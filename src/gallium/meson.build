@@ -204,6 +204,11 @@ if with_gallium_zink
 else
   driver_zink = declare_dependency()
 endif
+if with_gallium_pvrgl
+  subdir('drivers/pvrgl')
+else
+  driver_pvrgl = declare_dependency()
+endif
 if with_gallium_d3d12
   subdir('drivers/d3d12')
 else

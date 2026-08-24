@@ -252,3 +252,35 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+
+if with_gallium_pvrgl
+  executable(
+    'pvrws_probe',
+    files(
+      'winsys/pvrws_probe.c',
+      'winsys/powervr/pvr_drm.c',
+      'winsys/powervr/pvr_drm_bo.c',
+      'winsys/powervr/pvr_drm_job_compute.c',
+      'winsys/powervr/pvr_drm_job_null.c',
+      'winsys/powervr/pvr_drm_job_render.c',
+      'winsys/powervr/pvr_drm_job_transfer.c',
+      'winsys/pvr_winsys.c',
+      'winsys/pvr_winsys_helper.c',
+    ),
+    include_directories : [pvr_includes, inc_imagination, inc_include, inc_src],
+    link_with : [
+      libpowervr_common,
+    ],
+    dependencies : [
+      dep_csbgen,
+      dep_libdrm,
+      idep_mesautil,
+      idep_vulkan_runtime,
+      idep_vulkan_util,
+      idep_vulkan_wsi,
+      idep_nir_headers,
+    ],
+    c_args : pvr_flags,
+    build_by_default : true,
+  )
+endif
