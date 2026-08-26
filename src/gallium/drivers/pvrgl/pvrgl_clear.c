@@ -34,6 +34,10 @@ pvrgl_clear(struct pipe_context *pctx, unsigned buffers, unsigned width,
       return;
    }
 
+   mesa_logi("pvrgl: clear r=%.3f g=%.3f b=%.3f a=%.3f -> dev_addr=0x%llx",
+             color->f[0], color->f[1], color->f[2], color->f[3],
+             (unsigned long long)pvrgl_resource(ctx->color_res)->dev_addr);
+
    pvrgl_tq_clear_surface(ctx->screen, pvrgl_resource(ctx->color_res),
                           color->f);
 }

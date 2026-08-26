@@ -22,6 +22,7 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <vulkan/vulkan.h>
@@ -146,6 +147,11 @@ VkResult pvr_drm_winsys_transfer_submit(
    struct drm_pvr_ioctl_submit_jobs_args args = {
       .jobs = DRM_PVR_OBJ_ARRAY(1, &job_args),
    };
+
+   fprintf(stderr, "WSUBMIT: len=%u stream=%llx handle=%u\n",
+           submit_info->cmds[0].fw_stream_len,
+           (unsigned long long)(uintptr_t)submit_info->cmds[0].fw_stream,
+           drm_ctx->handle);
 
    assert(submit_info->cmd_count == 1);
 

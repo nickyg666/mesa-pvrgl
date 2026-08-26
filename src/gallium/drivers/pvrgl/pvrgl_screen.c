@@ -15,10 +15,12 @@
 #include "util/u_inlines.h"
 #include "util/os_file.h"
 #include "util/u_screen.h"
+#include "compiler/nir/nir.h"
 
 #include "pvrgl_public.h"
 #include "pvrgl_alloc.h"
 #include "pvrgl_tq.h"
+#include "pvrgl_resource.h"
 
 #include "imagination/vulkan/winsys/pvr_winsys.h"
 #include "imagination/common/pvr_device_info.h"
@@ -143,6 +145,25 @@ pvrgl_create_screen(int drm_fd)
       sc->max_shader_buffers = 0;
       sc->max_sampler_views = 8;
       sc->supported_irs = (1 << PIPE_SHADER_IR_NIR);
+   }
+
+   pvrgl_screen_init_resource_functions(&screen->base);
+
+   {
+      static const nir_shader_compiler_options pvrgl_nir_options = {
+         .fdot_replicates = true,
+         .lower_extract_byte = true,
+         .lower_extract_word = true,
+         .lower_insert_byte = true,
+         .lower_insert_word = true,
+         .lower_fdph = true,
+         .lower_fmod = true,
+         .lower_uniforms_to_ubo = true,
+         .lower_cs_local_index_to_id = true,
+         .max_unroll_iterations = 32,
+      };
+      for (unsigned s = 0; s < MESA_SHADER_MESH_STAGES; s++)
+         screen->base.nir_options[s] = &pvrgl_nir_options;
    }
 
    mesa_logi("pvrgl: screen created ok");

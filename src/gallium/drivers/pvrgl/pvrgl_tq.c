@@ -63,6 +63,8 @@ struct pvrgl_bo {
    struct pvr_winsys_bo *bo;
    struct pvr_winsys_vma *vma;
    uint64_t heap_offset;
+   /* Full device address (heap base + offset) as returned by vma_map. */
+   uint64_t dev_addr;
 };
 
 static VkResult
@@ -98,6 +100,7 @@ pvrgl_upload(struct pvrgl_screen *screen,
       if (vk != VK_SUCCESS)
          goto err_vma;
       out->heap_offset = addr.addr - heap->base_addr.addr;
+      out->dev_addr = addr.addr;
    }
 
    vk = screen->ws->ops->buffer_map(out->bo, NULL);
@@ -687,9 +690,16 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       reg.val = packed_color[3U];
    }
 
-   state.pds_shader_task_offset = tq->nop.pds.heap_offset;
-   state.uni_tex_code_offset = 0U;
-   state.tex_state_data_offset = 0U;
+   /* These state fields are consumed as ABSOLUTE device addresses by the
+    * reg packers; the PDS program lives in the general heap, so base its
+    * heap_offset with the general-heap base. Unused bases still point at
+    * the heap base (offset 0) to keep the fw happy. */
+   state.pds_shader_task_offset =
+      screen->heaps->general_heap->base_addr.addr + tq->nop.pds.heap_offset;
+   state.uni_tex_code_offset =
+      screen->heaps->general_heap->base_addr.addr;
+   state.tex_state_data_offset =
+      screen->heaps->general_heap->base_addr.addr;
    state.common_ptr = 0U;
 
    /* ---- Surface/render params → PBE words [ref :1244]. ---- */
@@ -784,10 +794,10 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
                       ROGUE_CR_EVENT_PIXEL_PDS_INFO_CONST_SIZE_UNIT_SIZE);
    }
    pvr_csb_pack (&regs->event_pixel_pds_data, CR_EVENT_PIXEL_PDS_DATA, reg) {
-      reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset);
+      reg.addr = PVR_DEV_ADDR(event_pds_bo.dev_addr);
    }
    pvr_csb_pack (&regs->event_pixel_pds_code, CR_EVENT_PIXEL_PDS_CODE, reg) {
-      reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset +
+      reg.addr = PVR_DEV_ADDR(event_pds_bo.dev_addr +
                               event_program.data_size * 4);
    }
 
@@ -866,7 +876,7 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       }
 
       pvr_csb_pack (&regs->isp_mtile_base, CR_ISP_MTILE_BASE, reg) {
-         reg.addr = PVR_DEV_ADDR(cs_bo.heap_offset);
+         reg.addr = PVR_DEV_ADDR(cs_bo.dev_addr);
       }
 
       if (sipf2 && PVR_HAS_FEATURE(dev_info, ipf_creq_pf)) {
@@ -880,6 +890,7 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
 
    /* ---- fw stream pack [ref :5810]. ---- */
    cmd = &submit_info.cmds[0];
+   memset(cmd, 0, sizeof(*cmd));
    {
       uint32_t *stream_ptr = (uint32_t *)cmd->fw_stream;
 
@@ -915,15 +926,31 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       *stream_ptr++ = regs->isp_render;
       *stream_ptr++ = regs->isp_rgn;
 
+      /* NOTE: kernel gates frag_screen on ITS OWN GPU_MULTICORE_SUPPORT
+       * verdict; BXM-4-64 MC1 is single-core so the kernel does NOT consume
+       * this word. Emitting it anyway leaves a trailing u32 -> ext-stream
+       * parse -> EINVAL. Match the kernel until feature tables agree. */
       if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support))
-         *stream_ptr++ = regs->frag_screen;
+         mesa_logi("pvrgl: FIXME multicore_support=1 but kernel may disagree");
 
       cmd->fw_stream_len = (uint8_t *)stream_ptr - (uint8_t *)cmd->fw_stream;
       assert(cmd->fw_stream_len <= ARRAY_SIZE(cmd->fw_stream));
+
+      /* KMD stream header [ref kernel pvr_stream_process]: first u32 is the
+       * total stream length (header included), second u32 must be zero.
+       * The parser validates main_stream_len >= 8 && <= stream_size. */
+      {
+         uint32_t *hdr32 = (uint32_t *)cmd->fw_stream;
+         hdr32[0] = cmd->fw_stream_len;
+         hdr32[1] = 0U;
+         mesa_logi("pvrgl: TQ stream len=%u hdr=[%08x %08x %08x %08x]",
+                   cmd->fw_stream_len, hdr32[0], hdr32[1], hdr32[2], hdr32[3]);
+      }
    }
 
    /* ---- Submit (async; caller verifies via CPU map polling). ---- */
-   memset(&submit_info, 0, sizeof(submit_info));
+   /* NOTE: no memset here — cmds[0] was fully populated above; zeroing the
+    * struct now would wipe fw_stream_len and the packed stream. */
    submit_info.frame_num = 0U;
    submit_info.job_num = 0U;
    submit_info.wait = NULL;
@@ -933,6 +960,8 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
                                          dev_info, NULL);
    if (vk != VK_SUCCESS)
       mesa_logw("pvrgl: transfer_submit failed %d", vk);
+   else
+      mesa_logi("pvrgl: TQ clear submitted ok");
 
 err_event_pds:
    /* Keep the BOs alive briefly on success so the async job's references
