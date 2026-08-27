@@ -17,6 +17,8 @@ files_pvrgl = files(
   'pvrgl_state.c',
   # TQ clear backend + linked arch helpers from the vulkan driver.
   'pvrgl_tq.c',
+  # M3 render path: HWRT dataset + RENDER context + geometry/fragment submit.
+  'pvrgl_render.c',
   '../../../imagination/vulkan/pvr_arch_job_common.c',
   '../../../imagination/vulkan/pvr_arch_formats.c',
   '../../../imagination/vulkan/pvr_usc.c',

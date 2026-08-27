@@ -19,6 +19,7 @@
 
 #include "pvrgl_public.h"
 #include "pvrgl_alloc.h"
+#include "pvrgl_render.h"
 #include "pvrgl_tq.h"
 #include "pvrgl_resource.h"
 
@@ -106,6 +107,13 @@ pvrgl_create_screen(int drm_fd)
       if (res != VK_SUCCESS) {
          mesa_logw("pvrgl: TQ init failed: %d", res);
          goto out_fail_alloc;
+      }
+
+      if (getenv("PVRGL_RENDER_TEST")) {
+         res = pvrgl_render_selftest(screen);
+         mesa_logi("pvrgl: RENDER_TEST result=%d", res);
+         if (res != VK_SUCCESS)
+            mesa_logw("pvrgl: render selftest failed: %d", res);
       }
    }
 

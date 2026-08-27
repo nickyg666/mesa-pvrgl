@@ -59,21 +59,15 @@ struct pvrgl_tq_state {
 /* Upload helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-struct pvrgl_bo {
-   struct pvr_winsys_bo *bo;
-   struct pvr_winsys_vma *vma;
-   uint64_t heap_offset;
-   /* Full device address (heap base + offset) as returned by vma_map. */
-   uint64_t dev_addr;
-};
-
-static VkResult
-pvrgl_upload(struct pvrgl_screen *screen,
-             struct pvr_winsys_heap *heap,
-             const void *data,
-             uint32_t size,
-             uint32_t align,
-             struct pvrgl_bo *out)
+VkResult
+pvrgl_upload_flags(struct pvrgl_screen *screen,
+                   struct pvr_winsys_heap *heap,
+                   const void *data,
+                   uint32_t size,
+                   uint32_t align,
+                   uint32_t flags,
+                   struct pvrgl_bo *out,
+                   struct pvr_winsys_vma **vma_out)
 {
    const uint32_t page = 4096;
    const uint32_t alloc_size = align64(MAX2(size, page), page);
@@ -85,7 +79,7 @@ pvrgl_upload(struct pvrgl_screen *screen,
                                        alloc_size,
                                        page,
                                        PVR_WINSYS_BO_TYPE_GPU,
-                                       PVR_WINSYS_BO_FLAG_CPU_ACCESS,
+                                       flags,
                                        &out->bo);
    if (vk != VK_SUCCESS)
       return vk;
@@ -103,12 +97,19 @@ pvrgl_upload(struct pvrgl_screen *screen,
       out->dev_addr = addr.addr;
    }
 
-   vk = screen->ws->ops->buffer_map(out->bo, NULL);
-   if (vk != VK_SUCCESS)
-      goto err_vma;
+   if (vma_out)
+      *vma_out = out->vma;
+
+   /* Only CPU-map when CPU access was requested: PM_FW_PROTECT BOs have no
+    * userspace mapping and buffer_map() fails on them. */
+   if (flags & PVR_WINSYS_BO_FLAG_CPU_ACCESS) {
+      vk = screen->ws->ops->buffer_map(out->bo, NULL);
+      if (vk != VK_SUCCESS)
+         goto err_map;
+   }
 
    /* New GEM BOs are zeroed by the kernel; copy payload when given. */
-   if (data)
+   if (data && out->bo->map)
       memcpy(out->bo->map, data, size);
 
    {
@@ -129,6 +130,9 @@ pvrgl_upload(struct pvrgl_screen *screen,
 
    return VK_SUCCESS;
 
+err_map:
+   if (out->vma && out->vma->bo)
+      screen->ws->ops->vma_unmap(out->vma);
 err_vma:
    screen->ws->ops->heap_free(out->vma);
 err_bo:
@@ -136,7 +140,19 @@ err_bo:
    return vk;
 }
 
-static void
+VkResult
+pvrgl_upload(struct pvrgl_screen *screen,
+             struct pvr_winsys_heap *heap,
+             const void *data,
+             uint32_t size,
+             uint32_t align,
+             struct pvrgl_bo *out)
+{
+   return pvrgl_upload_flags(screen, heap, data, size, align,
+                             PVR_WINSYS_BO_FLAG_CPU_ACCESS, out, NULL);
+}
+
+void
 pvrgl_bo_free(struct pvrgl_screen *screen, struct pvrgl_bo *gbo)
 {
    if (!gbo->bo)
