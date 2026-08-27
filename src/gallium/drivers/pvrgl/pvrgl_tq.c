@@ -111,6 +111,22 @@ pvrgl_upload(struct pvrgl_screen *screen,
    if (data)
       memcpy(out->bo->map, data, size);
 
+   {
+      const char *hname = "?";
+      if (screen->heaps->general_heap == heap)
+         hname = "general";
+      else if (screen->heaps->pds_heap == heap)
+         hname = "pds";
+      else if (screen->heaps->usc_heap == heap)
+         hname = "usc";
+      else if (screen->heaps->transfer_frag_heap == heap)
+         hname = "tfrag";
+      mesa_logi("pvrgl: alloc heap=%s size=%u dev_addr=0x%llx heap_offset=0x%llx",
+                hname, size,
+                (unsigned long long)out->dev_addr,
+                (unsigned long long)out->heap_offset);
+   }
+
    return VK_SUCCESS;
 
 err_vma:
@@ -189,6 +205,17 @@ pvrgl_tq_upload_eot(struct pvrgl_screen *screen,
                      cache_line,
                      &tq->eot[rt_count - 1].bo);
    tq->eot[rt_count - 1].temps = pco_shader_data(eot)->common.temps;
+   {
+      /* Dump EOT binary for comparison with upstream-generated program. */
+      const uint32_t *bin = (const uint32_t *)pco_shader_binary_data(eot);
+      size_t nw = pco_shader_binary_size(eot) / 4;
+      char hx[512]; size_t off = 0;
+      for (size_t i = 0; i < nw && off < sizeof(hx) - 12; i++)
+         off += snprintf(hx + off, sizeof(hx) - off, "%08x ", bin[i]);
+      mesa_logi("pvrgl: EOT%d size=%u temps=%u words=%u %s",
+                rt_count, (unsigned)pco_shader_binary_size(eot),
+                (unsigned)pco_shader_data(eot)->common.temps, (unsigned)nw, hx);
+   }
    ralloc_free(eot);
 
    return vk;
@@ -349,66 +376,6 @@ pvrgl_write_prim_block_fill(const struct pvr_device_info *dev_info,
       PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format_v2);
    uint32_t *cs_ptr = *cs_ptr_out;
    const uint32_t num_isp_vertices = 4U;
-
-   /* ---- PDS state block [ref :3350]. ---- */
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_SHADERBASE, shader_base) {
-      shader_base.addr = PVR_DEV_ADDR(state->pds_shader_task_offset);
-   }
-   cs_ptr++;
-
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_TEXUNICODEBASE, tex_base) {
-      tex_base.addr = PVR_DEV_ADDR(state->uni_tex_code_offset);
-   }
-   cs_ptr++;
-
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_SIZEINFO1, info1) {
-      info1.pds_uniformsize =
-         state->uniform_data_size /
-         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE;
-      info1.pds_texturestatesize =
-         state->tex_state_data_size /
-         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_TEXTURESTATESIZE_UNIT_SIZE;
-      info1.pds_varyingsize =
-         state->coeff_data_size /
-         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_VARYINGSIZE_UNIT_SIZE;
-      info1.usc_varyingsize =
-         ALIGN_POT(state->usc_coeff_regs,
-                   ROGUE_TA_STATE_PDS_SIZEINFO1_USC_VARYINGSIZE_UNIT_SIZE) /
-         ROGUE_TA_STATE_PDS_SIZEINFO1_USC_VARYINGSIZE_UNIT_SIZE;
-      info1.pds_tempsize =
-         ALIGN_POT(state->pds_temps,
-                   ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_TEMPSIZE_UNIT_SIZE) /
-         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_TEMPSIZE_UNIT_SIZE;
-   }
-   cs_ptr++;
-
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_VARYINGBASE, base) {
-      base.addr = PVR_DEV_ADDR(state->pds_coeff_task_offset);
-   }
-   cs_ptr++;
-
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_TEXTUREDATABASE, base) {
-      base.addr = PVR_DEV_ADDR(state->tex_state_data_offset);
-   }
-   cs_ptr++;
-
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_UNIFORMDATABASE, base) {
-      base.addr = PVR_DEV_ADDR(0U);
-   }
-   cs_ptr++;
-
-   pvr_csb_pack (cs_ptr, TA_STATE_PDS_SIZEINFO2, info) {
-      info.usc_sharedsize =
-         ALIGN_POT(state->common_ptr,
-                   ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE) /
-         ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE;
-      info.pds_tri_merge_disable = !PVR_HAS_ENHANCEMENT(dev_info, 42307);
-      info.pds_batchnum = 0U;
-   }
-   cs_ptr++;
-
-   if (sipf)
-      cs_ptr++; /* realign to 64 bits */
 
    /* ---- ISP state block [ref :3425]. ---- */
    if (sipf2) {
@@ -588,6 +555,67 @@ pvrgl_write_prim_block_fill(const struct pvr_device_info *dev_info,
       }
    }
 
+   /* ---- PDS state block [ref :3350]. ---- */
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_SHADERBASE, shader_base) {
+      shader_base.addr = PVR_DEV_ADDR(state->pds_shader_task_offset);
+   }
+   cs_ptr++;
+
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_TEXUNICODEBASE, tex_base) {
+      tex_base.addr = PVR_DEV_ADDR(state->uni_tex_code_offset);
+   }
+   cs_ptr++;
+
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_SIZEINFO1, info1) {
+      info1.pds_uniformsize =
+         state->uniform_data_size /
+         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE;
+      info1.pds_texturestatesize =
+         state->tex_state_data_size /
+         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_TEXTURESTATESIZE_UNIT_SIZE;
+      info1.pds_varyingsize =
+         state->coeff_data_size /
+         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_VARYINGSIZE_UNIT_SIZE;
+      info1.usc_varyingsize =
+         ALIGN_POT(state->usc_coeff_regs,
+                   ROGUE_TA_STATE_PDS_SIZEINFO1_USC_VARYINGSIZE_UNIT_SIZE) /
+         ROGUE_TA_STATE_PDS_SIZEINFO1_USC_VARYINGSIZE_UNIT_SIZE;
+      info1.pds_tempsize =
+         ALIGN_POT(state->pds_temps,
+                   ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_TEMPSIZE_UNIT_SIZE) /
+         ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_TEMPSIZE_UNIT_SIZE;
+   }
+   cs_ptr++;
+
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_VARYINGBASE, base) {
+      base.addr = PVR_DEV_ADDR(state->pds_coeff_task_offset);
+   }
+   cs_ptr++;
+
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_TEXTUREDATABASE, base) {
+      base.addr = PVR_DEV_ADDR(state->tex_state_data_offset);
+   }
+   cs_ptr++;
+
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_UNIFORMDATABASE, base) {
+      base.addr = PVR_DEV_ADDR(0U);
+   }
+   cs_ptr++;
+
+   pvr_csb_pack (cs_ptr, TA_STATE_PDS_SIZEINFO2, info) {
+      info.usc_sharedsize =
+         ALIGN_POT(state->common_ptr,
+                   ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE) /
+         ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE;
+      info.pds_tri_merge_disable = !PVR_HAS_ENHANCEMENT(dev_info, 42307);
+      info.pds_batchnum = 0U;
+   }
+   cs_ptr++;
+
+   if (sipf)
+      cs_ptr++; /* realign to 64 bits */
+
+
    *cs_ptr_out = cs_ptr;
 }
 
@@ -648,6 +676,7 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
    struct pvrgl_bo event_pds_bo;
    struct pvrgl_bo cs_bo;
    uint32_t tile_x, tile_y;
+   uint32_t code_off = 0;
    VkResult vk;
 
    memset(&event_pds_bo, 0, sizeof(event_pds_bo));
@@ -702,17 +731,19 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
    /* ---- Surface/render params → PBE words [ref :1244]. ---- */
    memset(&surf_params, 0, sizeof(surf_params));
    {
-      /* B8G8R8A8_UNORM channel swizzle X,Y,Z,W (memory-order BGRA). */
-      surf_params.swizzle[0] = 0; /* X */
-      surf_params.swizzle[1] = 1; /* Y */
-      surf_params.swizzle[2] = 2; /* Z */
-      surf_params.swizzle[3] = 3; /* W */
+      /* Channel swizzle for BGRA memory: the PBE source is RGBA (clear
+       * registers), so map B<-R, R<-B (upstream uses pvr_get_format_swizzle,
+       * which is not linked into pvrgl; B8G8R8A8 == {Z,Y,X,W} = {2,1,0,3}). */
+      surf_params.swizzle[0] = 2; /* B <- source Z (blue from red slot) */
+      surf_params.swizzle[1] = 1; /* G <- source Y */
+      surf_params.swizzle[2] = 0; /* R <- source X */
+      surf_params.swizzle[3] = 3; /* A <- source W */
 
       surf_params.is_normalized = true;
       surf_params.nr_components = 4;
 
       pvr_arch_pbe_get_src_format_and_gamma(
-         PIPE_FORMAT_BGRA8888_UNORM,
+         VK_FORMAT_B8G8R8A8_UNORM,
          PVR_PBE_GAMMA_NONE,
          false,
          &surf_params.source_format,
@@ -721,7 +752,7 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       /* Color fill of normalized 8888 uses an 8bpc source [ref :1070]. */
       surf_params.source_format = ROGUE_PBESTATE_SOURCE_FORMAT_8_PER_CHANNEL;
       surf_params.pbe_packmode = pvr_arch_get_pbe_packmode(
-         PIPE_FORMAT_BGRA8888_UNORM);
+         VK_FORMAT_B8G8R8A8_UNORM);
 
       surf_params.addr.addr = dst->dev_addr;
       surf_params.mem_layout = PVR_MEMLAYOUT_LINEAR;
@@ -747,11 +778,13 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
 
       pvr_arch_pbe_pack_state(dev_info, &surf_params, &render_params,
                               pbe_words, &regs->pbe_wordx_mrty[0]);
+
+
    }
 
    /* ---- Pixel-event PDS program [ref :1152]. ---- */
    memset(&event_program, 0, sizeof(event_program));
-   event_program.emit_words = (uint32_t *)&regs->pbe_wordx_mrty[0];
+   event_program.emit_words = pbe_words;
    event_program.num_emit_word_pairs = 1U;
 
    pvr_pds_setup_doutu(&event_program.task_control,
@@ -773,11 +806,30 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       pvr_pds_generate_pixel_event_code_segment(
          &event_program, staging + event_program.data_size, dev_info);
 
+      {
+         char hx[512]; size_t off = 0;
+         size_t nw = (event_program.code_size + event_program.data_size);
+         for (size_t i = 0; i < nw && off < sizeof(hx) - 12; i++)
+            off += snprintf(hx + off, sizeof(hx) - off, "%08x ", staging[i]);
+         mesa_logi("pvrgl: EVPDS dsize=%u csize=%u words=%u emit_pairs=%u %s",
+                   event_program.data_size, event_program.code_size,
+                   (unsigned)nw, event_program.num_emit_word_pairs, hx);
+      }
+
       /* Event PDS program must live on the PDS code/data heap: the
        * EVENT_PIXEL_PDS_CODE/DATA addr fields are offsets relative to the
        * PDS heap base (upstream pvr_pds_upload uses device->suballoc_pds and
        * subtracts pds_heap->base_addr). General-heap offsets made the FW
        * fetch the event program from a bogus address -> context reset. */
+      /* Code must start at a 16-byte-aligned offset: the
+       * EVENT_PIXEL_PDS_CODE addr field is 28-bit with shift=4 (16-byte
+       * address units), so an unaligned code offset truncates on the
+       * FW side and it executes the tail of the data segment as code
+       * (upstream pvr_gpu_upload_pds: code_offset = ALIGN_POT(data_size,
+       * code_alignment)). */
+      code_off =
+         ALIGN_POT(event_program.data_size * 4,
+                   ROGUE_CR_EVENT_PIXEL_PDS_CODE_ADDR_ALIGNMENT);
       vk = pvrgl_upload(screen,
                         screen->heaps->pds_heap,
                         staging,
@@ -787,6 +839,13 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       free(staging);
       if (vk != VK_SUCCESS)
          return vk;
+
+      /* Relocate the code segment to the aligned offset within the BO. */
+      memcpy((uint8_t *)event_pds_bo.bo->map + code_off,
+             (uint8_t *)event_pds_bo.bo->map + event_program.data_size * 4,
+             event_program.code_size * 4);
+      mesa_logi("pvrgl: EVPDS code_off=0x%x data_size=%u code_size=%u",
+                code_off, event_program.data_size, event_program.code_size);
    }
 
    pvr_csb_pack (&regs->event_pixel_pds_info, CR_EVENT_PIXEL_PDS_INFO, reg) {
@@ -794,6 +853,9 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       reg.const_size =
          DIV_ROUND_UP(event_program.data_size,
                       ROGUE_CR_EVENT_PIXEL_PDS_INFO_CONST_SIZE_UNIT_SIZE);
+      reg.usc_sr_size =
+         DIV_ROUND_UP(1 * PVR_STATE_PBE_DWORDS,
+                      ROGUE_CR_EVENT_PIXEL_PDS_INFO_USC_SR_SIZE_UNIT_SIZE);
    }
    /* CR_EVENT_PIXEL_PDS_CODE/DATA addr fields are 28-bit OFFSETS (shift=4,
     * cr.xml: "This is an offset actually") — heap-relative like upstream's
@@ -804,8 +866,7 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset);
    }
    pvr_csb_pack (&regs->event_pixel_pds_code, CR_EVENT_PIXEL_PDS_CODE, reg) {
-      reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset +
-                              event_program.data_size * 4);
+      reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset + code_off);
    }
 
    pvrgl_setup_hwbg_object(&state);
@@ -900,6 +961,16 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       }
    }
 
+   /* ---- Fragment screen [ref :3023]: the FW needs the render
+    * dimensions in CR_FRAG_SCREEN or the ISP screen grid is degenerate
+    * (xmax=ymax=0, sparse pixel output). ---- */
+   if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support)) {
+      pvr_csb_pack (&regs->frag_screen, CR_FRAG_SCREEN, reg) {
+         reg.xmax = dst->base.width0 ? dst->base.width0 - 1 : 0;
+         reg.ymax = dst->base.height0 ? dst->base.height0 - 1 : 0;
+      }
+   }
+
    /* ---- fw stream pack [ref :5810]. ---- */
    cmd = &submit_info.cmds[0];
    memset(cmd, 0, sizeof(*cmd));
@@ -947,9 +1018,12 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support)) {
          *stream_ptr++ = regs->frag_screen;
       }
-      mesa_logi("pvrgl: feats multicore=%d xttop=%d",
+      mesa_logi("pvrgl: feats multicore=%d xttop=%d sipf=%d sipf2=%d ipf_creq_pf=%d",
                 PVR_HAS_FEATURE(dev_info, gpu_multicore_support),
-                PVR_HAS_FEATURE(dev_info, xt_top_infrastructure));
+                PVR_HAS_FEATURE(dev_info, xt_top_infrastructure),
+                PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format),
+                PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format_v2),
+                PVR_HAS_FEATURE(dev_info, ipf_creq_pf));
 
       cmd->fw_stream_len = (uint8_t *)stream_ptr - (uint8_t *)cmd->fw_stream;
       assert(cmd->fw_stream_len <= ARRAY_SIZE(cmd->fw_stream));
@@ -963,8 +1037,48 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
          hdr32[1] = 0U;
          mesa_logi("pvrgl: TQ stream len=%u hdr=[%08x %08x %08x %08x]",
                    cmd->fw_stream_len, hdr32[0], hdr32[1], hdr32[2], hdr32[3]);
+         /* Full stream hex dump for fault analysis. */
+         {
+            char hexbuf[1024];
+            size_t off = 0;
+            uint32_t *p = (uint32_t *)cmd->fw_stream;
+            size_t nw = cmd->fw_stream_len / 4;
+            for (size_t i = 0; i < nw && off < sizeof(hexbuf) - 12; i++)
+               off += snprintf(hexbuf + off, sizeof(hexbuf) - off,
+                               "%08x ", p[i]);
+            hexbuf[off] = 0;
+            mesa_logi("pvrgl: STREAM %s", hexbuf);
+            mesa_logi("pvrgl: PBE pbe_words0=0x%08x pbe_words1=0x%08x",
+                      pbe_words[0], pbe_words[1]);
+            mesa_logi("pvrgl: PDS event dev=0x%llx off=0x%llx cs dev=0x%llx off=0x%llx eot0 dev=0x%llx off=0x%llx",
+                      (unsigned long long)event_pds_bo.dev_addr,
+                      (unsigned long long)event_pds_bo.heap_offset,
+                      (unsigned long long)cs_bo.dev_addr,
+                      (unsigned long long)cs_bo.heap_offset,
+                      (unsigned long long)tq->eot[0].bo.dev_addr,
+                      (unsigned long long)tq->eot[0].bo.heap_offset);
+         }
       }
    }
+
+   mesa_logi("pvrgl: REGS mtile_base=0x%llx mtile_size=0x%x rgn_origin=0x%x ctl=0x%x aa=0x%x",
+            (unsigned long long)regs->isp_mtile_base,
+            regs->isp_mtile_size, regs->isp_render_origin, regs->isp_ctl,
+            regs->isp_aa);
+   mesa_logi("pvrgl: REGS bgnd0=0x%llx bgnd1=0x%llx bgnd3=0x%llx",
+            (unsigned long long)regs->pds_bgnd0_base,
+            (unsigned long long)regs->pds_bgnd1_base,
+            (unsigned long long)regs->pds_bgnd3_sizeinfo);
+   mesa_logi("pvrgl: REGS pds_info=0x%x pds_code=0x%x pds_data=0x%x isp_render=0x%x",
+            regs->event_pixel_pds_info, regs->event_pixel_pds_code,
+            regs->event_pixel_pds_data, regs->isp_render);
+   mesa_logi("pvrgl: REGS usc_pixout=0x%x bgobjvals=0x%x frag_screen=0x%x",
+            regs->usc_pixel_output_ctrl, regs->isp_bgobjvals,
+            regs->frag_screen);
+   mesa_logi("pvrgl: MRY0=0x%llx MRY1=0x%llx MRY2=0x%llx",
+            (unsigned long long)regs->pbe_wordx_mrty[0],
+            (unsigned long long)regs->pbe_wordx_mrty[1],
+            (unsigned long long)regs->pbe_wordx_mrty[2]);
 
    /* ---- Submit (async; caller verifies via CPU map polling). ---- */
    /* NOTE: no memset here — cmds[0] was fully populated above; zeroing the
