@@ -690,16 +690,13 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       reg.val = packed_color[3U];
    }
 
-   /* These state fields are consumed as ABSOLUTE device addresses by the
-    * reg packers; the PDS program lives in the general heap, so base its
-    * heap_offset with the general-heap base. Unused bases still point at
-    * the heap base (offset 0) to keep the fw happy. */
-   state.pds_shader_task_offset =
-      screen->heaps->general_heap->base_addr.addr + tq->nop.pds.heap_offset;
-   state.uni_tex_code_offset =
-      screen->heaps->general_heap->base_addr.addr;
-   state.tex_state_data_offset =
-      screen->heaps->general_heap->base_addr.addr;
+   /* No-shader clear: upstream (pvr_arch_job_transfer.c:2873-2875) zeroes
+    * all PDS bases for the source_count==0 path — USC_SHAREDSIZE=0 in
+    * pds_bgnd3_sizeinfo makes the FW ignore the PDS program entirely, and
+    * the clear is performed purely via USC clear registers + ISP. */
+   state.pds_shader_task_offset = 0U;
+   state.uni_tex_code_offset = 0U;
+   state.tex_state_data_offset = 0U;
    state.common_ptr = 0U;
 
    /* ---- Surface/render params → PBE words [ref :1244]. ---- */
@@ -776,8 +773,13 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       pvr_pds_generate_pixel_event_code_segment(
          &event_program, staging + event_program.data_size, dev_info);
 
+      /* Event PDS program must live on the PDS code/data heap: the
+       * EVENT_PIXEL_PDS_CODE/DATA addr fields are offsets relative to the
+       * PDS heap base (upstream pvr_pds_upload uses device->suballoc_pds and
+       * subtracts pds_heap->base_addr). General-heap offsets made the FW
+       * fetch the event program from a bogus address -> context reset. */
       vk = pvrgl_upload(screen,
-                        screen->heaps->general_heap,
+                        screen->heaps->pds_heap,
                         staging,
                         (event_program.code_size + event_program.data_size) * 4,
                         16,
@@ -793,11 +795,16 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
          DIV_ROUND_UP(event_program.data_size,
                       ROGUE_CR_EVENT_PIXEL_PDS_INFO_CONST_SIZE_UNIT_SIZE);
    }
+   /* CR_EVENT_PIXEL_PDS_CODE/DATA addr fields are 28-bit OFFSETS (shift=4,
+    * cr.xml: "This is an offset actually") — heap-relative like upstream's
+    * pds_upload.data_offset. Passing the absolute dev_addr truncated to
+    * garbage -> FW event-program jump fault -> FWCCB_CMD_CONTEXT_RESET
+    * (0x2abc0069) -> job dies, no pixels. */
    pvr_csb_pack (&regs->event_pixel_pds_data, CR_EVENT_PIXEL_PDS_DATA, reg) {
-      reg.addr = PVR_DEV_ADDR(event_pds_bo.dev_addr);
+      reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset);
    }
    pvr_csb_pack (&regs->event_pixel_pds_code, CR_EVENT_PIXEL_PDS_CODE, reg) {
-      reg.addr = PVR_DEV_ADDR(event_pds_bo.dev_addr +
+      reg.addr = PVR_DEV_ADDR(event_pds_bo.heap_offset +
                               event_program.data_size * 4);
    }
 
@@ -875,8 +882,13 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
          }
       }
 
+      /* FW addresses are heap-relative: subtract the heap base (upstream
+       * pvr_arch_job_transfer.c:4143 does exactly this). Passing the absolute
+       * device addr made the ISP read the control stream from a bogus
+       * location -> clear silently wrote nothing. */
       pvr_csb_pack (&regs->isp_mtile_base, CR_ISP_MTILE_BASE, reg) {
-         reg.addr = PVR_DEV_ADDR(cs_bo.dev_addr);
+         reg.addr = PVR_DEV_ADDR(cs_bo.dev_addr -
+                                 screen->heaps->transfer_frag_heap->base_addr.addr);
       }
 
       if (sipf2 && PVR_HAS_FEATURE(dev_info, ipf_creq_pf)) {
@@ -926,12 +938,18 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
       *stream_ptr++ = regs->isp_render;
       *stream_ptr++ = regs->isp_rgn;
 
-      /* NOTE: kernel gates frag_screen on ITS OWN GPU_MULTICORE_SUPPORT
-       * verdict; BXM-4-64 MC1 is single-core so the kernel does NOT consume
-       * this word. Emitting it anyway leaves a trailing u32 -> ext-stream
-       * parse -> EINVAL. Match the kernel until feature tables agree. */
-      if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support))
-         mesa_logi("pvrgl: FIXME multicore_support=1 but kernel may disagree");
+      /* Kernel gates frag_screen on ITS OWN feature table (dev-query), and
+       * mesa's dev_info mirrors that same table, so gating on the identical
+       * feature macro keeps the packed stream length in lockstep with what
+       * pvr_stream_process_1() will consume. (BXM-4-64 MC1 reports
+       * gpu_multicore_support=1 -> kernel consumes frag_screen -> we must
+       * emit it or the parse runs 4 bytes short -> EINVAL.) */
+      if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support)) {
+         *stream_ptr++ = regs->frag_screen;
+      }
+      mesa_logi("pvrgl: feats multicore=%d xttop=%d",
+                PVR_HAS_FEATURE(dev_info, gpu_multicore_support),
+                PVR_HAS_FEATURE(dev_info, xt_top_infrastructure));
 
       cmd->fw_stream_len = (uint8_t *)stream_ptr - (uint8_t *)cmd->fw_stream;
       assert(cmd->fw_stream_len <= ARRAY_SIZE(cmd->fw_stream));
