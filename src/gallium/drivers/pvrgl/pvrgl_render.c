@@ -198,6 +198,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
          max_pages,
          PVRGL_GLOBAL_FL_GROW >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT,
          PVRGL_GLOBAL_FL_GROW_THRESHOLD, NULL, &r->global_fl);
+      mesa_logi("pvrgl: render init step global_fl vk=%d", vk);
       if (vk != VK_SUCCESS) {
          pvrgl_bo_free(screen, &fl_bo);
          goto err_free;
@@ -230,6 +231,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
       vk = screen->ws->ops->free_list_create(
          screen->ws, fl_vma, min_pages, min_pages, 0, 0, r->global_fl,
          &r->local_fl);
+      mesa_logi("pvrgl: render init step local_fl vk=%d", vk);
       if (vk != VK_SUCCESS) {
          pvrgl_bo_free(screen, &fl_bo);
          goto err_global_fl;
@@ -358,6 +360,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
 
    vk = screen->ws->ops->render_target_dataset_create(
       screen->ws, &create_info, dev_info, &r->rt_dataset);
+   mesa_logi("pvrgl: render init step rt_dataset vk=%d", vk);
    if (vk != VK_SUCCESS)
       goto err_rgn;
 
@@ -382,6 +385,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
 
       vk = screen->ws->ops->render_ctx_create(screen->ws, &rctx_info,
                                               dev_info, &r->rctx);
+      mesa_logi("pvrgl: render init step rctx vk=%d", vk);
       if (vk != VK_SUCCESS)
          goto err_callstack;
    }
@@ -550,8 +554,15 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
                        VkFormat rt_format)
 {
    const struct pvr_device_info *dev_info = r->screen->dev_info;
-   const bool multicore =
-      PVR_HAS_FEATURE(dev_info, gpu_multicore_support);
+   /* BXM-4-64 MC1 has NO gpu_multicore_support — mesa's feature table wrongly
+    * claims it (upstream FIXME). Emitting the multicore-gated fields
+    * (isp_oclqry_stride/execute_count) makes the kernel stream parse reject
+    * with EINVAL (trailing data). Kernel truth: pvr_stream_defs.c gates them
+    * on PVR_FEATURE_GPU_MULTICORE_SUPPORT, which is false for this part.
+    * Verified 2026-08-27: full submit dump shows 200B stream vs kernel's
+    * 192B expected. */
+   const bool multicore = false;
+   (void)dev_info;
    struct pvr_pbe_surf_params surf_params;
    struct pvr_pbe_render_params render_params;
    uint32_t pbe_words[ROGUE_NUM_PBESTATE_STATE_WORDS];
@@ -592,6 +603,7 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
 
    /* ---- PBE words [ref pvr_arch_job_common.c pvr_arch_pbe_pack_state]. */
    memset(&surf_params, 0, sizeof(surf_params));
+   memset(&render_params, 0, sizeof(render_params));
    {
       /* pvr_get_format_swizzle() is not in the pvrgl link set; B8G8R8A8 ==
        * {Z,Y,X,W} = {2,1,0,3} (verified against upstream in M2). */
@@ -629,9 +641,21 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
       render_params.slice = 0U;
       render_params.mrt_index = 0U;
 
+      /* Zero the full 192B pbe region first (pack_state only writes 3 u64s). */
+      memset(stream_ptr, 0,
+             PVR_MAX_COLOR_ATTACHMENTS * ROGUE_NUM_PBESTATE_REG_WORDS *
+                DWORDS_PER_U64 * sizeof(uint32_t));
+
       pvr_arch_pbe_pack_state(dev_info, &surf_params, &render_params,
                               pbe_words, (uint64_t *)stream_ptr);
-      stream_ptr += ROGUE_NUM_PBESTATE_REG_WORDS * DWORDS_PER_U64;
+
+      /* Kernel expects the FULL pbe_word[8][3] array (192B) — PVR_STREAM_DEF_ARRAY
+       * consumes sizeof(regs.pbe_word). Upstream memcpys job->pbe_reg_words
+       * (8 x ROGUE_NUM_PBESTATE_REG_WORDS x u64), MRT0 packed, others zero.
+       * Without the full array the kernel stream parse runs out of data -> EINVAL.
+       * Verified 2026-08-27 (submit dump + kernel pvr_stream_defs.c). */
+      stream_ptr += PVR_MAX_COLOR_ATTACHMENTS * ROGUE_NUM_PBESTATE_REG_WORDS *
+                    DWORDS_PER_U64;
    }
 
    pvr_csb_pack ((uint64_t *)stream_ptr, CR_TPU_BORDER_COLOUR_TABLE_PDM,
@@ -649,10 +673,15 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
    stream_ptr += 3U * DWORDS_PER_U64;
 
-   /* USC clear registers: 4 zeroed (P1: no color clear via render yet). */
+   /* USC clear registers: kernel expects the FULL
+    * usc_clear_register[ROGUE_MAXIMUM_OUTPUT_REGISTERS_PER_PIXEL=8] array
+    * (8 x u32 = 32B) — PVR_STREAM_DEF_ARRAY consumes sizeof(regs.usc_clear_register).
+    * kmd_stream.xml: usc_clear_register size=256 bits. pvrgl emitted only 4
+    * (16B) -> kernel stream parse ran out of data -> EINVAL. Zero all 8
+    * (P1: no color clear via render yet). */
    {
       uint32_t i;
-      for (i = 0; i < 4U; i++) {
+      for (i = 0; i < 8U; i++) {
          pvr_csb_pack (stream_ptr, CR_USC_CLEAR_REGISTER, reg) {
             reg.val = 0;
          }
