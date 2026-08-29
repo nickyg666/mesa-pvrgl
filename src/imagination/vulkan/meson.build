@@ -270,6 +270,8 @@ if with_gallium_pvrgl
     include_directories : [pvr_includes, inc_imagination, inc_include, inc_src],
     link_with : [
       libpowervr_common,
+      libpowervr_pds,
+      libpowervr_uscgen,
     ],
     dependencies : [
       dep_csbgen,
@@ -279,6 +281,7 @@ if with_gallium_pvrgl
       idep_vulkan_util,
       idep_vulkan_wsi,
       idep_nir_headers,
+      idep_pco_uscgen_programs_headers,
     ],
     c_args : pvr_flags,
     build_by_default : true,

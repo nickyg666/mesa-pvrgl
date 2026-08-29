@@ -38,7 +38,7 @@ files_pvrgl_winsys = files(
 
 libpvrgl = static_library(
   'pvrgl',
-  files_pvrgl + files_pvrgl_winsys,
+  [files_pvrgl, files_pvrgl_winsys, pvr_entrypoints[1]],
   include_directories : [
     inc_include, inc_src, inc_gallium, inc_gallium_aux,
     inc_imagination,
