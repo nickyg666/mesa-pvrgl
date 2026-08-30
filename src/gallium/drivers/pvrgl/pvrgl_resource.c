@@ -155,6 +155,42 @@ pvrgl_transfer_map(struct pipe_context *pctx,
          ? 0 : (uint64_t)tx->base.stride * pres->height0;
 
       uint8_t *map = res->bo->map;
+      /* DEBUG: raw BO contents on any CPU READ map of a 2D color surface */
+      if ((usage & PIPE_MAP_READ) && pres->target != PIPE_BUFFER &&
+          map && debug_get_bool_option("PVRGL_DUMP_SRC", false)) {
+         const uint32_t *raw = (const uint32_t *)map;
+         unsigned red = 0, other = 0, listed = 0;
+         const unsigned total = (unsigned)(tx->base.stride / 4) * pres->height0;
+         mesa_logi("pvrgl: BO READ dump fmt=%s %ux%u stride=%u map=%p dev=%llx",
+                   util_format_name(pres->format), pres->width0,
+                   pres->height0, tx->base.stride, map,
+                   (unsigned long long)res->dev_addr);
+         for (unsigned i = 0; i < total; i++) {
+            if (raw[i] == 0xff0000ffu) red++;
+            else if (raw[i] != 0) {
+               other++;
+               if (listed < 24) {
+                  mesa_logi("  nz[%3u] off=%4u (%3u,%3u) val=%08x",
+                            listed, i, i % (total / pres->height0),
+                            i / (total / pres->height0), raw[i]);
+                  listed++;
+               }
+            }
+         }
+         mesa_logi("  total: red=%u nonred_nonzero=%u (of %u)",
+                   red, other, total);
+         /* per-row non-zero census — maps the clear-write geometry */
+         {
+            const unsigned ppw = total / pres->height0;
+            for (unsigned r = 0; r < pres->height0; r++) {
+               unsigned cnt = 0;
+               for (unsigned i = r * ppw; i < (r + 1) * ppw; i++)
+                  if (raw[i] != 0) cnt++;
+               if (cnt)
+                  mesa_logi("  row %2u: %3u/%u nz", r, cnt, ppw);
+            }
+         }
+      }
       if (pres->target == PIPE_BUFFER) {
          map += box->x;
       } else {

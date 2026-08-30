@@ -14,6 +14,7 @@ struct pvrgl_resource {
    struct pvr_winsys_vma *vma;
    uint64_t dev_addr;
    uint32_t stride; /* bytes per row for 2D */
+   bool twiddled;   /* memory layout is PVR twiddled (Morton), not linear */
 };
 
 struct pvrgl_resource *

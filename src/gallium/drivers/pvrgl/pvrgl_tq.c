@@ -771,8 +771,17 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
          VK_FORMAT_B8G8R8A8_UNORM);
 
       surf_params.addr.addr = dst->dev_addr;
+      /* NOTE: LINEAR is the PROVEN path (M2 pixel proof). TWIDDLED+stride=0
+       * was tried (2026-08-30) to fix the linear ~12%-coverage upstream bug:
+       * result = 4KB band of 0x001f0000 written at surface+0x1000, no clear.
+       * Do not re-enable without FW-level investigation. */
       surf_params.mem_layout = PVR_MEMLAYOUT_LINEAR;
-      surf_params.stride = dst->stride;
+      /* Upstream stride unit = TEXELS per row (PBE linestride field packs
+       * (texels-1)/2, UNIT_SIZE=2). Passing BYTES made the PBE advance
+       * stride-texels per row → every-4th-row 25% coverage. */
+      surf_params.stride = dst->stride /
+         util_format_get_blocksize(dst->base.format);
+      dst->twiddled = false;
       surf_params.depth = 1U;
       surf_params.width = dst->base.width0;
       surf_params.height = dst->base.height0;
