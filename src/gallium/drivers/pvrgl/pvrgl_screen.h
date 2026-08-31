@@ -19,6 +19,7 @@ struct pvr_winsys_heaps;
 struct pvr_device_info;
 struct pvr_device_runtime_info;
 struct pvrgl_tq;
+struct pvrgl_render;
 
 struct pvrgl_screen {
    struct pipe_screen base;
@@ -34,6 +35,7 @@ struct pvrgl_screen {
    /* Transfer (TQ) context: used for clears / blits / PBE ops. */
    struct pvr_winsys_transfer_ctx *tctx;
    struct pvrgl_tq *tq_priv;
+   struct pvrgl_render *render_priv;
 
    bool winsys_ok;
 };

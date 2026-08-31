@@ -20,6 +20,7 @@
 #include "pvrgl_render.h"
 #include "pvrgl_screen.h"
 #include "pvrgl_tq.h"
+#include "pvrgl_resource.h"
 
 #include "hwdef/rogue_hw_defs.h"
 #include "hwdef/rogue_hw_utils.h"
@@ -101,6 +102,8 @@ struct pvrgl_render {
    uint32_t bg_shareds_count;  /* consts dwords (BGRND3.usc_sharedsize). */
    struct pvrgl_bo scissor_bo;        /* one full-RT IPF scissor entry. */
    struct pvrgl_bo depth_bias_bo;     /* one zeroed entry. */
+   /* Bound render-target geometry (dataset cache key). */
+   uint32_t tgt_w, tgt_h;
 };
 
 static uint32_t
@@ -324,38 +327,32 @@ err_loadop:
    return vk;
 }
 
-VkResult
-pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
+static VkResult
+pvrgl_render_dataset_init(struct pvrgl_render *r, uint32_t width, uint32_t height)
 {
+   struct pvrgl_screen *screen = r->screen;
    const struct pvr_device_info *dev_info = screen->dev_info;
    const struct pvr_device_runtime_info *runtime_info = screen->runtime_info;
    struct pvr_winsys_rt_dataset_create_info create_info;
-   struct pvrgl_render *r;
    struct pvr_rt_mtile_info mtile;
    uint32_t tile_size_x, tile_size_y;
    uint32_t mtiles_x, mtiles_y;
    uint32_t num_tiles_x, num_tiles_y;
    uint32_t num_mtiles_x, num_mtiles_y;
    uint32_t max_num_mtiles;
-   uint32_t cache_line_size;
-   uint64_t vheap_size;
    uint64_t tpc_size;
    uint64_t rgn_headers_size;
    uint32_t single_rgn_header_size;
    uint32_t version;
    uint32_t group_size;
+   uint32_t cache_line_size;
    VkResult vk;
-
-   r = calloc(1, sizeof(*r));
-   if (!r)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   r->screen = screen;
 
    /* ---- Macrotile info [ref pvr_arch_rt_mtile_info_init]. ---- */
    tile_size_x = PVR_GET_FEATURE_VALUE(dev_info, tile_size_x, 16U);
    tile_size_y = PVR_GET_FEATURE_VALUE(dev_info, tile_size_y, 16U);
-   num_tiles_x = DIV_ROUND_UP(PVRGL_RT_WIDTH, tile_size_x);
-   num_tiles_y = DIV_ROUND_UP(PVRGL_RT_HEIGHT, tile_size_y);
+   num_tiles_x = DIV_ROUND_UP(width, tile_size_x);
+   num_tiles_y = DIV_ROUND_UP(height, tile_size_y);
 
    rogue_get_num_macrotiles_xy(dev_info, &mtiles_x, &mtiles_y);
 
@@ -387,82 +384,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
    mtile.tiles_per_mtile_x = mtile.mtile_x1;
    mtile.tiles_per_mtile_y = mtile.mtile_y1;
 
-   /* ---- Global free list. ---- */
-   {
-      struct pvr_winsys_vma *fl_vma = NULL;
-      struct pvrgl_bo fl_bo;
-      uint32_t max_pages =
-         PVRGL_GLOBAL_FL_MAX >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT;
-      uint32_t fl_size = ALIGN_POT(max_pages * 4U, 64U * 1024U);
-
-      vk = pvrgl_upload_flags(screen, screen->heaps->general_heap, NULL,
-                              fl_size, 64U * 1024U,
-                              PVR_WINSYS_BO_FLAG_GPU_UNCACHED |
-                                 PVR_WINSYS_BO_FLAG_PM_FW_PROTECT,
-                              &fl_bo, &fl_vma);
-      if (vk != VK_SUCCESS)
-         goto err_free;
-
-      vk = screen->ws->ops->free_list_create(
-         screen->ws, fl_vma,
-         PVRGL_GLOBAL_FL_INITIAL >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT,
-         max_pages,
-         PVRGL_GLOBAL_FL_GROW >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT,
-         PVRGL_GLOBAL_FL_GROW_THRESHOLD, NULL, &r->global_fl);
-      mesa_logi("pvrgl: render init step global_fl vk=%d", vk);
-      if (vk != VK_SUCCESS) {
-         pvrgl_bo_free(screen, &fl_bo);
-         goto err_free;
-      }
-      /* Keep the BO alive for the life of the free list. */
-      r->global_fl_bo = fl_bo;
-   }
-
-   /* ---- Local free list (child of global, fixed min size). ---- */
-   {
-      struct pvr_winsys_vma *fl_vma = NULL;
-      struct pvrgl_bo fl_bo;
-      /* Kernel requires page counts aligned to FREE_LIST_ALIGNMENT (4 pages);
-       * mesa aligns the byte size to the SLC-based size alignment (64KB)
-       * before converting to pages. */
-      uint64_t local_size =
-         align64(runtime_info->min_free_list_size, 64U * 1024U);
-      uint32_t min_pages =
-         local_size >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT;
-      uint32_t fl_size = ALIGN_POT(MAX2(min_pages, 1U) * 4U, 64U * 1024U);
-
-      vk = pvrgl_upload_flags(screen, screen->heaps->general_heap, NULL,
-                              fl_size, 64U * 1024U,
-                              PVR_WINSYS_BO_FLAG_GPU_UNCACHED |
-                                 PVR_WINSYS_BO_FLAG_PM_FW_PROTECT,
-                              &fl_bo, &fl_vma);
-      if (vk != VK_SUCCESS)
-         goto err_global_fl;
-
-      vk = screen->ws->ops->free_list_create(
-         screen->ws, fl_vma, min_pages, min_pages, 0, 0, r->global_fl,
-         &r->local_fl);
-      mesa_logi("pvrgl: render init step local_fl vk=%d", vk);
-      if (vk != VK_SUCCESS) {
-         pvrgl_bo_free(screen, &fl_bo);
-         goto err_global_fl;
-      }
-      r->local_fl_bo = fl_bo;
-   }
-
    cache_line_size = pvr_get_slc_cache_line_size(dev_info);
-
-   /* ---- VHEAP + RTC BO. ---- */
-   vheap_size = ROGUE_CR_PM_VHEAP_TABLE_SIZE * ROGUE_PM_VHEAP_ENTRY_SIZE;
-   {
-      uint64_t align =
-         MAX2(ROGUE_CR_PM_VHEAP_TABLE_BASE_ADDR_ALIGNMENT,
-              ROGUE_CR_TA_RTC_ADDR_BASE_ALIGNMENT);
-      vk = pvrgl_upload(screen, screen->heaps->general_heap, NULL,
-                        vheap_size, align, &r->vheap_rtc_bo);
-      if (vk != VK_SUCCESS)
-         goto err_local_fl;
-   }
 
    /* ---- TPC BO. ---- */
    num_mtiles_x = mtiles_x * mtile.tiles_per_mtile_x;
@@ -483,7 +405,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
                      tpc_size, ROGUE_CR_TE_TPC_ADDR_BASE_ALIGNMENT,
                      &r->tpc_bo);
    if (vk != VK_SUCCESS)
-      goto err_vheap;
+      goto err_free;
 
    /* ---- MList BO (macrotile array size is 0 for SIPF cores). ---- */
    {
@@ -526,26 +448,26 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
    /* ---- RT dataset create info. ---- */
    memset(&create_info, 0, sizeof(create_info));
    create_info.local_free_list = r->local_fl;
-   create_info.width = PVRGL_RT_WIDTH;
-   create_info.height = PVRGL_RT_HEIGHT;
+   create_info.width = width;
+   create_info.height = height;
    create_info.samples = PVRGL_RT_SAMPLES;
    create_info.layers = PVRGL_RT_LAYERS;
 
    if (PVR_HAS_ENHANCEMENT(dev_info, 42307)) {
       float value;
-      value = ROGUE_ISP_MERGE_LOWER_LIMIT_NUMERATOR / (float)PVRGL_RT_WIDTH;
+      value = ROGUE_ISP_MERGE_LOWER_LIMIT_NUMERATOR / (float)width;
       create_info.isp_merge_lower_x = fui(value);
-      value = ROGUE_ISP_MERGE_UPPER_LIMIT_NUMERATOR / (float)PVRGL_RT_WIDTH;
+      value = ROGUE_ISP_MERGE_UPPER_LIMIT_NUMERATOR / (float)width;
       create_info.isp_merge_upper_x = fui(value);
-      value = ROGUE_ISP_MERGE_LOWER_LIMIT_NUMERATOR / (float)PVRGL_RT_HEIGHT;
+      value = ROGUE_ISP_MERGE_LOWER_LIMIT_NUMERATOR / (float)height;
       create_info.isp_merge_lower_y = fui(value);
-      value = ROGUE_ISP_MERGE_UPPER_LIMIT_NUMERATOR / (float)PVRGL_RT_HEIGHT;
+      value = ROGUE_ISP_MERGE_UPPER_LIMIT_NUMERATOR / (float)height;
       create_info.isp_merge_upper_y = fui(value);
-      value = ((float)PVRGL_RT_WIDTH * ROGUE_ISP_MERGE_SCALE_FACTOR) /
+      value = ((float)width * ROGUE_ISP_MERGE_SCALE_FACTOR) /
               (ROGUE_ISP_MERGE_UPPER_LIMIT_NUMERATOR -
                ROGUE_ISP_MERGE_LOWER_LIMIT_NUMERATOR);
       create_info.isp_merge_scale_x = fui(value);
-      value = ((float)PVRGL_RT_HEIGHT * ROGUE_ISP_MERGE_SCALE_FACTOR) /
+      value = ((float)height * ROGUE_ISP_MERGE_SCALE_FACTOR) /
               (ROGUE_ISP_MERGE_UPPER_LIMIT_NUMERATOR -
                ROGUE_ISP_MERGE_LOWER_LIMIT_NUMERATOR);
       create_info.isp_merge_scale_y = fui(value);
@@ -571,9 +493,158 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
 
    vk = screen->ws->ops->render_target_dataset_create(
       screen->ws, &create_info, dev_info, &r->rt_dataset);
-   mesa_logi("pvrgl: render init step rt_dataset vk=%d", vk);
    if (vk != VK_SUCCESS)
       goto err_rgn;
+
+   /* ---- ISP scissor BO (size-dependent). ---- */
+   {
+      uint32_t scissor[2] = { 0 };
+      pvr_csb_pack (&scissor[0], IPF_SCISSOR_WORD_0, w0) {
+         w0.scw0_xmax = width;
+         w0.scw0_xmin = 0;
+      }
+      pvr_csb_pack (&scissor[1], IPF_SCISSOR_WORD_1, w1) {
+         w1.scw1_ymax = height;
+         w1.scw1_ymin = 0;
+      }
+      vk = pvrgl_upload(screen, screen->heaps->general_heap, scissor,
+                        sizeof(scissor), cache_line_size, &r->scissor_bo);
+      if (vk != VK_SUCCESS)
+         goto err_dataset;
+   }
+
+   mesa_logi("pvrgl: dataset %ux%u ready (fl=%llu/%u)",
+             width, height,
+             (unsigned long long)runtime_info->min_free_list_size,
+             PVRGL_GLOBAL_FL_INITIAL);
+   return VK_SUCCESS;
+
+err_dataset:
+   screen->ws->ops->render_target_dataset_destroy(r->rt_dataset);
+   r->rt_dataset = NULL;
+err_rgn:
+   pvrgl_bo_free(screen, &r->rgn_hdr_bo);
+err_mlist:
+   pvrgl_bo_free(screen, &r->mlist_bo);
+err_tpc:
+   pvrgl_bo_free(screen, &r->tpc_bo);
+err_free:
+   return vk;
+}
+
+static VkResult
+pvrgl_render_bind_target(struct pvrgl_render *r, uint32_t width, uint32_t height)
+{
+   struct pvrgl_screen *screen = r->screen;
+   VkResult vk;
+
+   if (r->rt_dataset && r->tgt_w == width && r->tgt_h == height)
+      return VK_SUCCESS;
+
+   if (r->rt_dataset) {
+      screen->ws->ops->render_target_dataset_destroy(r->rt_dataset);
+      r->rt_dataset = NULL;
+      pvrgl_bo_free(screen, &r->scissor_bo);
+      pvrgl_bo_free(screen, &r->rgn_hdr_bo);
+      pvrgl_bo_free(screen, &r->mlist_bo);
+      pvrgl_bo_free(screen, &r->tpc_bo);
+   }
+
+   vk = pvrgl_render_dataset_init(r, width, height);
+   if (vk != VK_SUCCESS)
+      return vk;
+
+   r->tgt_w = width;
+   r->tgt_h = height;
+   return VK_SUCCESS;
+}
+
+VkResult
+pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
+{
+   const struct pvr_device_info *dev_info = screen->dev_info;
+   const struct pvr_device_runtime_info *runtime_info = screen->runtime_info;
+   struct pvrgl_render *r;
+   uint32_t cache_line_size;
+   VkResult vk;
+
+   r = calloc(1, sizeof(*r));
+   if (!r)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   r->screen = screen;
+
+   /* ---- Global free list. ---- */
+   {
+      struct pvr_winsys_vma *fl_vma = NULL;
+      struct pvrgl_bo fl_bo;
+      uint32_t max_pages =
+         PVRGL_GLOBAL_FL_MAX >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT;
+      uint32_t fl_size = ALIGN_POT(max_pages * 4U, 64U * 1024U);
+
+      vk = pvrgl_upload_flags(screen, screen->heaps->general_heap, NULL,
+                              fl_size, 64U * 1024U,
+                              PVR_WINSYS_BO_FLAG_GPU_UNCACHED |
+                                 PVR_WINSYS_BO_FLAG_PM_FW_PROTECT,
+                              &fl_bo, &fl_vma);
+      if (vk != VK_SUCCESS)
+         goto err_free;
+
+      vk = screen->ws->ops->free_list_create(
+         screen->ws, fl_vma,
+         PVRGL_GLOBAL_FL_INITIAL >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT,
+         max_pages,
+         PVRGL_GLOBAL_FL_GROW >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT,
+         PVRGL_GLOBAL_FL_GROW_THRESHOLD, NULL, &r->global_fl);
+      if (vk != VK_SUCCESS) {
+         pvrgl_bo_free(screen, &fl_bo);
+         goto err_free;
+      }
+      /* Keep the BO alive for the life of the free list. */
+      r->global_fl_bo = fl_bo;
+   }
+
+   /* ---- Local free list (child of global, fixed min size). ---- */
+   {
+      struct pvr_winsys_vma *fl_vma = NULL;
+      struct pvrgl_bo fl_bo;
+      uint64_t local_size =
+         align64(runtime_info->min_free_list_size, 64U * 1024U);
+      uint32_t min_pages =
+         local_size >> ROGUE_BIF_PM_PHYSICAL_PAGE_SHIFT;
+      uint32_t fl_size = ALIGN_POT(MAX2(min_pages, 1U) * 4U, 64U * 1024U);
+
+      vk = pvrgl_upload_flags(screen, screen->heaps->general_heap, NULL,
+                              fl_size, 64U * 1024U,
+                              PVR_WINSYS_BO_FLAG_GPU_UNCACHED |
+                                 PVR_WINSYS_BO_FLAG_PM_FW_PROTECT,
+                              &fl_bo, &fl_vma);
+      if (vk != VK_SUCCESS)
+         goto err_global_fl;
+
+      vk = screen->ws->ops->free_list_create(
+         screen->ws, fl_vma, min_pages, min_pages, 0, 0, r->global_fl,
+         &r->local_fl);
+      if (vk != VK_SUCCESS) {
+         pvrgl_bo_free(screen, &fl_bo);
+         goto err_global_fl;
+      }
+      r->local_fl_bo = fl_bo;
+   }
+
+   cache_line_size = pvr_get_slc_cache_line_size(dev_info);
+
+   /* ---- VHEAP + RTC BO. ---- */
+   {
+      uint64_t vheap_size = ROGUE_CR_PM_VHEAP_TABLE_SIZE *
+                            ROGUE_PM_VHEAP_ENTRY_SIZE;
+      uint64_t align =
+         MAX2(ROGUE_CR_PM_VHEAP_TABLE_BASE_ADDR_ALIGNMENT,
+              ROGUE_CR_TA_RTC_ADDR_BASE_ALIGNMENT);
+      vk = pvrgl_upload(screen, screen->heaps->general_heap, NULL,
+                        vheap_size, align, &r->vheap_rtc_bo);
+      if (vk != VK_SUCCESS)
+         goto err_local_fl;
+   }
 
    /* ---- VDM callstack BO + RENDER context. ---- */
    {
@@ -584,24 +655,21 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
                         ROGUE_CR_VDM_CALL_STACK_POINTER_ADDR_ALIGNMENT,
                         &r->vdm_callstack_bo);
       if (vk != VK_SUCCESS)
-         goto err_rt_dataset;
+         goto err_vheap;
 
       memset(&rctx_info, 0, sizeof(rctx_info));
       rctx_info.priority = PVR_WINSYS_CTX_PRIORITY_MEDIUM;
       rctx_info.vdm_callstack_addr.addr = r->vdm_callstack_bo.dev_addr;
-      /* Minimal static state: kernel only bounds-checks; single-shot jobs
-       * never trigger context switch/resume. */
       rctx_info.static_state.rogue.vdm_ctx_state_base_addr = 0;
       rctx_info.static_state.rogue.geom_ctx_state_base_addr = 0;
 
       vk = screen->ws->ops->render_ctx_create(screen->ws, &rctx_info,
                                               dev_info, &r->rctx);
-      mesa_logi("pvrgl: render init step rctx vk=%d", vk);
       if (vk != VK_SUCCESS)
          goto err_callstack;
    }
 
-   /* ---- Aux BOs. ---- */
+   /* ---- Aux BOs (size-independent). ---- */
    {
       uint32_t terminate;
       pvr_csb_pack (&terminate, VDMCTRL_STREAM_TERMINATE, x);
@@ -615,32 +683,13 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
       if (vk != VK_SUCCESS)
          goto err_ctrl;
 
-      {
-         uint32_t scissor[2] = { 0 };
-         pvr_csb_pack (&scissor[0], IPF_SCISSOR_WORD_0, w0) {
-            w0.scw0_xmax = PVRGL_RT_WIDTH;
-            w0.scw0_xmin = 0;
-         }
-         pvr_csb_pack (&scissor[1], IPF_SCISSOR_WORD_1, w1) {
-            w1.scw1_ymax = PVRGL_RT_HEIGHT;
-            w1.scw1_ymin = 0;
-         }
-         vk = pvrgl_upload(screen, screen->heaps->general_heap, scissor,
-                           sizeof(scissor), cache_line_size, &r->scissor_bo);
-         if (vk != VK_SUCCESS)
-            goto err_border;
-      }
-
       vk = pvrgl_upload(screen, screen->heaps->general_heap, NULL,
                         64U, cache_line_size, &r->depth_bias_bo);
       if (vk != VK_SUCCESS)
-         goto err_scissor;
+         goto err_border;
    }
 
-   mesa_logi("pvrgl: render init ok (rt=%ux%u fl=%llu/%u rctx=%p)",
-             PVRGL_RT_WIDTH, PVRGL_RT_HEIGHT,
-             (unsigned long long)runtime_info->min_free_list_size,
-             PVRGL_GLOBAL_FL_INITIAL, (void *)r->rctx);
+   mesa_logi("pvrgl: render init ok (ctx=%p)", (void *)r->rctx);
 
    /* BG-object clear chain — failure is non-fatal (stream falls back to
     * zero bgnd, current behavior) but log loudly. */
@@ -648,11 +697,19 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
    if (vk != VK_SUCCESS)
       mesa_logw("pvrgl: bg-clear init failed vk=%d (bgnd stays zero)", vk);
 
+   /* ORDER EXPERIMENT: create the dataset before first submit, matching
+    * the pre-refactor init order (dataset existed at rctx-create time). */
+   vk = pvrgl_render_dataset_init(r, PVRGL_RT_WIDTH, PVRGL_RT_HEIGHT);
+   if (vk != VK_SUCCESS)
+      goto err_bias;
+   r->tgt_w = PVRGL_RT_WIDTH;
+   r->tgt_h = PVRGL_RT_HEIGHT;
+
    *out = r;
    return VK_SUCCESS;
 
-err_scissor:
-   pvrgl_bo_free(screen, &r->scissor_bo);
+err_bias:
+   pvrgl_bo_free(screen, &r->depth_bias_bo);
 err_border:
    pvrgl_bo_free(screen, &r->border_colour_bo);
 err_ctrl:
@@ -661,14 +718,6 @@ err_rctx:
    screen->ws->ops->render_ctx_destroy(r->rctx);
 err_callstack:
    pvrgl_bo_free(screen, &r->vdm_callstack_bo);
-err_rt_dataset:
-   screen->ws->ops->render_target_dataset_destroy(r->rt_dataset);
-err_rgn:
-   pvrgl_bo_free(screen, &r->rgn_hdr_bo);
-err_mlist:
-   pvrgl_bo_free(screen, &r->mlist_bo);
-err_tpc:
-   pvrgl_bo_free(screen, &r->tpc_bo);
 err_vheap:
    pvrgl_bo_free(screen, &r->vheap_rtc_bo);
 err_local_fl:
@@ -697,10 +746,10 @@ pvrgl_render_fini(struct pvrgl_render *r)
    pvrgl_bo_free(screen, &r->scissor_bo);
    pvrgl_bo_free(screen, &r->border_colour_bo);
    pvrgl_bo_free(screen, &r->ctrl_stream_bo);
-   pvrgl_bo_free(screen, &r->event_pds_bo);
    screen->ws->ops->render_ctx_destroy(r->rctx);
    pvrgl_bo_free(screen, &r->vdm_callstack_bo);
-   screen->ws->ops->render_target_dataset_destroy(r->rt_dataset);
+   if (r->rt_dataset)
+      screen->ws->ops->render_target_dataset_destroy(r->rt_dataset);
    pvrgl_bo_free(screen, &r->rgn_hdr_bo);
    pvrgl_bo_free(screen, &r->mlist_bo);
    pvrgl_bo_free(screen, &r->tpc_bo);
@@ -775,7 +824,9 @@ static void
 pvrgl_frag_stream_init(struct pvrgl_render *r,
                        struct pvr_winsys_fragment_state *state,
                        const struct pvrgl_bo *rt_bo,
-                       VkFormat rt_format)
+                       VkFormat rt_format,
+                       uint32_t width, uint32_t height,
+                       uint32_t clear_dword)
 {
    const struct pvr_device_info *dev_info = r->screen->dev_info;
    /* BXM-4-64 MC1: the kernel's own feature query reports
@@ -853,18 +904,18 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
 
       surf_params.addr.addr = rt_bo->dev_addr;
       surf_params.mem_layout = PVR_MEMLAYOUT_LINEAR;
-      surf_params.stride = PVRGL_RT_WIDTH * 4U;
+      surf_params.stride = width * 4U;
       surf_params.depth = 1U;
-      surf_params.width = PVRGL_RT_WIDTH;
-      surf_params.height = PVRGL_RT_HEIGHT;
+      surf_params.width = width;
+      surf_params.height = height;
       surf_params.z_only_render = false;
       surf_params.down_scale = false;
 
       memset(&render_params, 0, sizeof(render_params));
       render_params.min_x_clip = 0U;
       render_params.min_y_clip = 0U;
-      render_params.max_x_clip = PVRGL_RT_WIDTH - 1U;
-      render_params.max_y_clip = PVRGL_RT_HEIGHT - 1U;
+      render_params.max_x_clip = width - 1U;
+      render_params.max_y_clip = height - 1U;
       render_params.source_start = PVR_PBE_STARTPOS_BIT0;
       render_params.slice = 0U;
       render_params.mrt_index = 0U;
@@ -1014,7 +1065,7 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
       uint32_t i;
       for (i = 0; i < 8U; i++) {
          pvr_csb_pack (stream_ptr, CR_USC_CLEAR_REGISTER, reg) {
-            reg.val = (i == 0U) ? 0xFF0000FFu : 0;
+            reg.val = (i == 0U) ? clear_dword : 0;
          }
          stream_ptr += pvr_cmd_length(CR_USC_CLEAR_REGISTER);
       }
@@ -1106,12 +1157,23 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
 }
 
 VkResult
-pvrgl_render_test_submit(struct pvrgl_render *r,
-                         const struct pvrgl_bo *rt_bo,
-                         VkFormat rt_format)
+pvrgl_render_submit(struct pvrgl_render *r,
+                    const struct pvrgl_bo *rt_bo,
+                    VkFormat rt_format,
+                    uint32_t width, uint32_t height,
+                    uint32_t clear_dword)
 {
    struct pvr_winsys_render_submit_info submit_info;
    VkResult vk;
+
+   vk = pvrgl_render_bind_target(r, width, height);
+   if (vk != VK_SUCCESS)
+      return vk;
+
+   /* Update the bgnd clear-color const BO — the FW's PDS DOUTD program
+    * re-reads it at every fragment-job kickoff. */
+   if (r->bg_const_bo.bo && r->bg_const_bo.bo->map)
+      memcpy(r->bg_const_bo.bo->map, &clear_dword, sizeof(clear_dword));
 
    memset(&submit_info, 0, sizeof(submit_info));
    submit_info.rt_dataset = r->rt_dataset;
@@ -1131,7 +1193,8 @@ pvrgl_render_test_submit(struct pvrgl_render *r,
    submit_info.fragment_pr.wait = NULL;
 
    pvrgl_geom_stream_init(r, &submit_info.geometry);
-   pvrgl_frag_stream_init(r, &submit_info.fragment, rt_bo, rt_format);
+   pvrgl_frag_stream_init(r, &submit_info.fragment, rt_bo, rt_format,
+                          width, height, clear_dword);
 
    /* The winsys always submits a partial-render (PR) fragment job from
     * fragment_pr — give it a valid copy of the fragment stream (with no
@@ -1167,7 +1230,8 @@ pvrgl_render_selftest(struct pvrgl_screen *screen)
    if (vk != VK_SUCCESS)
       goto out_fini;
 
-   vk = pvrgl_render_test_submit(r, &rt_bo, VK_FORMAT_B8G8R8A8_UNORM);
+   vk = pvrgl_render_submit(r, &rt_bo, VK_FORMAT_B8G8R8A8_UNORM,
+                            PVRGL_RT_WIDTH, PVRGL_RT_HEIGHT, 0xFF0000FFu);
    if (vk == VK_SUCCESS) {
       /* Pixel verdict: the FW executes asynchronously — poll the RT map
        * for the first non-zero dword for up to 2s, then report position
@@ -1197,4 +1261,98 @@ pvrgl_render_selftest(struct pvrgl_screen *screen)
 out_fini:
    pvrgl_render_fini(r);
    return vk;
+}
+
+/* ---- Production clear entry (called from pvrgl_clear.c). ---- */
+
+#define PVRGL_CLEAR_WIDTH_MAX  16384u
+#define PVRGL_CLEAR_HEIGHT_MAX 16384u
+
+static uint8_t
+pvrgl_u8fix(float v)
+{
+   float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+   return (uint8_t)(c * 255.0f + 0.5f);
+}
+
+/* Pack RGBA-float clear color into the accum-format dword the bgnd USC
+ * const + usc_clear_register0 expect [ref pvr_pack_clear_color,
+ * U8U8U8U8 normalized branch]. */
+static VkResult
+pvrgl_pack_clear_dword(enum pipe_format fmt, const float f[4],
+                       uint32_t *out)
+{
+   switch (fmt) {
+   case PIPE_FORMAT_BGRA8888_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      /* accum order B,G,R,A */
+      *out = (uint32_t)pvrgl_u8fix(f[2]) |
+             ((uint32_t)pvrgl_u8fix(f[1]) << 8) |
+             ((uint32_t)pvrgl_u8fix(f[0]) << 16) |
+             ((uint32_t)pvrgl_u8fix(f[3]) << 24);
+      return VK_SUCCESS;
+   case PIPE_FORMAT_RGBA8888_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      *out = (uint32_t)pvrgl_u8fix(f[0]) |
+             ((uint32_t)pvrgl_u8fix(f[1]) << 8) |
+             ((uint32_t)pvrgl_u8fix(f[2]) << 16) |
+             ((uint32_t)pvrgl_u8fix(f[3]) << 24);
+      return VK_SUCCESS;
+   default:
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+}
+
+VkResult
+pvrgl_render_clear(struct pvrgl_screen *screen, struct pipe_resource *res,
+                   const float color[4])
+{
+   struct pvrgl_resource *pres = pvrgl_resource(res);
+   struct pvrgl_bo tmp;
+   VkFormat vkf;
+   uint32_t clear_dword;
+   VkResult vk;
+
+   if (!pres || !pres->bo)
+      return VK_ERROR_INVALID_DEVICE_ADDRESS_EXT;
+
+   switch (res->format) {
+   case PIPE_FORMAT_BGRA8888_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      vkf = VK_FORMAT_B8G8R8A8_UNORM;
+      break;
+   case PIPE_FORMAT_RGBA8888_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      vkf = VK_FORMAT_R8G8B8A8_UNORM;
+      break;
+   default:
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+
+   vk = pvrgl_pack_clear_dword(res->format, color, &clear_dword);
+   if (vk != VK_SUCCESS)
+      return vk;
+
+   if (res->width0 == 0 || res->height0 == 0 ||
+       res->width0 > PVRGL_CLEAR_WIDTH_MAX ||
+       res->height0 > PVRGL_CLEAR_HEIGHT_MAX)
+      return VK_ERROR_INVALID_DEVICE_ADDRESS_EXT;
+
+   if (!screen->render_priv) {
+      vk = pvrgl_render_init(screen, &screen->render_priv);
+      if (vk != VK_SUCCESS) {
+         screen->render_priv = NULL;
+         return vk;
+      }
+   }
+
+   /* Adapt the resource's BO into a pvrgl_bo view (heap_offset is only
+    * needed for uploads; the frag stream uses dev_addr). */
+   memset(&tmp, 0, sizeof(tmp));
+   tmp.bo = pres->bo;
+   tmp.vma = pres->vma;
+   tmp.dev_addr = pres->dev_addr;
+
+   return pvrgl_render_submit(screen->render_priv, &tmp, vkf,
+                              res->width0, res->height0, clear_dword);
 }

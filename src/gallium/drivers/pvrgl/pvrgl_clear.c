@@ -8,6 +8,7 @@
 #include "pvrgl_context.h"
 #include "pvrgl_resource.h"
 #include "pvrgl_tq.h"
+#include "pvrgl_render.h"
 
 #include <vulkan/vulkan.h>
 
@@ -37,6 +38,12 @@ pvrgl_clear(struct pipe_context *pctx, unsigned buffers, unsigned width,
    mesa_logi("pvrgl: clear r=%.3f g=%.3f b=%.3f a=%.3f -> dev_addr=0x%llx",
              color->f[0], color->f[1], color->f[2], color->f[3],
              (unsigned long long)pvrgl_resource(ctx->color_res)->dev_addr);
+
+   /* Native render path (HW bgnd clear) for 8888 formats; TQ fill
+    * fallback for everything else. */
+   if (pvrgl_render_clear(ctx->screen, ctx->color_res, color->f) ==
+       VK_SUCCESS)
+      return;
 
    pvrgl_tq_clear_surface(ctx->screen, pvrgl_resource(ctx->color_res),
                           color->f);
