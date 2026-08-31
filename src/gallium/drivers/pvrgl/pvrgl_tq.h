@@ -51,6 +51,20 @@ pvrgl_tq_init(struct pvrgl_screen *screen, struct pvrgl_tq **tq_out);
 void
 pvrgl_tq_finish(struct pvrgl_screen *screen, struct pvrgl_tq *tq);
 
+/* EOT USC program accessors (rt_idx is 0-based; the TQ pre-builds one EOT
+ * per RT count). The render path reuses eot[0] as its pixel-event DOUTU
+ * target. */
+struct pvrgl_bo *
+pvrgl_tq_eot_bo(struct pvrgl_tq *tq, unsigned rt_idx);
+
+typedef struct _pco_ctx pco_ctx; /* matches pco.h */
+
+pco_ctx *
+pvrgl_tq_pco_ctx(struct pvrgl_tq *tq);
+
+uint32_t
+pvrgl_tq_eot_temps(struct pvrgl_tq *tq, unsigned rt_idx);
+
 /* Submit a full-surface TQ fill/clear of `dst` with `color` (RGBA floats).
  * Asynchronous: caller observes completion by polling the BO CPU map.
  */

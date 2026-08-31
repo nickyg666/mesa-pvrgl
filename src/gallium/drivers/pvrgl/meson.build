@@ -22,6 +22,8 @@ files_pvrgl = files(
   '../../../imagination/vulkan/pvr_arch_job_common.c',
   '../../../imagination/vulkan/pvr_arch_formats.c',
   '../../../imagination/vulkan/pvr_usc.c',
+  # pvr_uscgen_loadop needs the PBE accum helpers in pvr_formats.c.
+  '../../../imagination/vulkan/pvr_formats.c',
 )
 
 # Shared imagination winsys — same sources the Vulkan driver compiles.

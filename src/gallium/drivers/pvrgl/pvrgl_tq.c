@@ -331,6 +331,28 @@ pvrgl_tq_finish(struct pvrgl_screen *screen, struct pvrgl_tq *tq)
    FREE(tq);
 }
 
+struct pvrgl_bo *
+pvrgl_tq_eot_bo(struct pvrgl_tq *tq, unsigned rt_idx)
+{
+   if (rt_idx >= ARRAY_SIZE(tq->eot) || !tq->eot[rt_idx].bo.bo)
+      return NULL;
+   return &tq->eot[rt_idx].bo;
+}
+
+uint32_t
+pvrgl_tq_eot_temps(struct pvrgl_tq *tq, unsigned rt_idx)
+{
+   if (rt_idx >= ARRAY_SIZE(tq->eot))
+      return 0;
+   return tq->eot[rt_idx].temps;
+}
+
+pco_ctx *
+pvrgl_tq_pco_ctx(struct pvrgl_tq *tq)
+{
+   return tq->pco_ctx;
+}
+
 /* ------------------------------------------------------------------ */
 /* Clear color packing — U8U8U8U8 normalized [ref :2372].              */
 /* ------------------------------------------------------------------ */
