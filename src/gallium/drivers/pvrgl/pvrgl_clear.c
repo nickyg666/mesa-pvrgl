@@ -40,9 +40,19 @@ pvrgl_clear(struct pipe_context *pctx, unsigned buffers, unsigned width,
              (unsigned long long)pvrgl_resource(ctx->color_res)->dev_addr);
 
    /* Native render path (HW bgnd clear) for 8888 formats; TQ fill
-    * fallback for everything else. */
-   if (pvrgl_render_clear(ctx->screen, ctx->color_res, color->f) ==
-       VK_SUCCESS)
+    * fallback for everything else. NOTE: the render path is still M3-WIP
+    * (submits accepted, EOT paints nothing) — keep it opt-in until it
+    * produces pixels. */
+   static bool render_clear_on = false;
+   static bool checked = false;
+   if (!checked) {
+      render_clear_on = getenv("PVRGL_RENDER_CLEAR") != NULL;
+      checked = true;
+   }
+
+   if (render_clear_on &&
+       pvrgl_render_clear(ctx->screen, ctx->color_res, color->f) ==
+          VK_SUCCESS)
       return;
 
    pvrgl_tq_clear_surface(ctx->screen, pvrgl_resource(ctx->color_res),
