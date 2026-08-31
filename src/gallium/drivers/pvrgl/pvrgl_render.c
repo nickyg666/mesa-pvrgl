@@ -23,13 +23,18 @@
 
 #include "hwdef/rogue_hw_defs.h"
 #include "hwdef/rogue_hw_utils.h"
-#include "pvr_csb.h"
-#include "pvr_csb_enum_helpers.h"
-#include "pvr_device_info.h"
-#include "pvr_formats.h"
-#include "pvr_job_common.h"
-#include "pvr_job_render.h"
-#include "pvr_winsys.h"
+#include "imagination/vulkan/pds/pvr_pds.h"
+#include "imagination/vulkan/pvr_csb.h"
+#include "imagination/vulkan/pvr_csb_enum_helpers.h"
+#include "imagination/common/pvr_device_info.h"
+#include "imagination/vulkan/pvr_formats.h"
+#include "imagination/vulkan/pvr_job_common.h"
+#include "imagination/vulkan/pvr_job_render.h"
+#include "imagination/vulkan/pvr_mrt.h"
+#include "imagination/vulkan/pvr_usc.h"
+#include "imagination/vulkan/winsys/pvr_winsys.h"
+#include "pco_uscgen_programs.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_math.h"
 
@@ -80,6 +85,20 @@ struct pvrgl_render {
    /* Aux BOs referenced by job streams. */
    struct pvrgl_bo ctrl_stream_bo;    /* VDM ctrl stream (terminate only). */
    struct pvrgl_bo border_colour_bo;  /* zeroed, never read without textures. */
+   struct pvrgl_bo event_pds_bo;      /* pixel-event PDS prog (EOT kicker). */
+
+   /* BG-object clear (load-op) chain [pvr_arch_mrt.c:642 recipe], built once
+    * at init; the frag stream packs bgnd_reg_values[] into CR_PDS_BGRND0/1/3
+    * (both the bgnd and PR-bgnd slots). */
+   struct pvrgl_bo bg_usc_bo;       /* USC clear shader (usc heap). */
+   struct pvrgl_bo bg_pds_frag_bo;  /* PDS kick-USC prog (data|code). */
+   struct pvrgl_bo bg_pds_tex_bo;   /* PDS DOUTD consts prog (data only). */
+   struct pvrgl_bo bg_pds_unitex_bo; /* PDS unitex code prog (texunicode). */
+   struct pvrgl_bo bg_const_bo;     /* clear-color dword (general heap). */
+   uint64_t bgnd_reg_values[3];
+   uint32_t bg_temps;          /* USC temps (BGRND3.pds_tempsize). */
+   uint32_t bg_tex_data_size;  /* DOUTD prog data size dwords (BGRND3). */
+   uint32_t bg_shareds_count;  /* consts dwords (BGRND3.usc_sharedsize). */
    struct pvrgl_bo scissor_bo;        /* one full-RT IPF scissor entry. */
    struct pvrgl_bo depth_bias_bo;     /* one zeroed entry. */
 };
@@ -111,6 +130,198 @@ pvrgl_rt_get_mlist_size(const struct pvr_winsys_free_list *global_fl,
                 ROGUE_NUM_PM_ADDRESS_SPACES * ROGUE_MLIST_ENTRY_STRIDE;
 
    return ALIGN_POT(mlist_size, ROGUE_BIF_PM_PHYSICAL_PAGE_SIZE);
+}
+
+static VkResult
+pvrgl_render_bg_clear_init(struct pvrgl_render *r)
+{
+   struct pvrgl_screen *screen = r->screen;
+   const struct pvr_device_info *dev_info = screen->dev_info;
+   pco_ctx *pco = pvrgl_tq_pco_ctx(screen->tq_priv);
+   uint32_t usc_bin_size;
+   struct usc_mrt_resource mrt_res;
+   struct usc_mrt_setup mrt_setup;
+   struct pvr_load_op load_op;
+   pco_shader *loadop;
+   pco_data *fs_data;
+   uint32_t *staging;
+   VkResult vk;
+
+   /* Minimal single-RT MRT setup: clear color -> USC output reg 0. */
+   memset(&mrt_res, 0, sizeof(mrt_res));
+   mrt_res.type = USC_MRT_RESOURCE_TYPE_OUTPUT_REG;
+   mrt_res.intermediate_size = 4;
+   mrt_res.reg.output_reg = 0;
+   memset(&mrt_setup, 0, sizeof(mrt_setup));
+   mrt_setup.num_render_targets = 1;
+   mrt_setup.num_output_regs = 1;
+   mrt_setup.mrt_resources = &mrt_res;
+
+   memset(&load_op, 0, sizeof(load_op));
+   load_op.is_hw_object = true;
+   load_op.clears_loads_state.rt_clear_mask = 1U;
+   load_op.clears_loads_state.dest_vk_format[0] = VK_FORMAT_B8G8R8A8_UNORM;
+   load_op.clears_loads_state.depth_clear_to_reg = PVR_NO_DEPTH_CLEAR_TO_REG;
+   load_op.clears_loads_state.mrt_setup = &mrt_setup;
+
+   /* 1. USC clear shader [pvr_arch_mrt.c:649]. uscgen also fills
+    *    shareds_count/const_shareds_count (pvr_usc.c:1278). */
+   loadop = pvr_uscgen_loadop(pco, &load_op);
+   if (!loadop)
+      return VK_ERROR_UNKNOWN;
+
+   r->bg_shareds_count = load_op.shareds_count;
+   usc_bin_size = pco_shader_binary_size(loadop);
+
+   vk = pvrgl_upload(screen, screen->heaps->usc_heap,
+                     pco_shader_binary_data(loadop),
+                     pco_shader_binary_size(loadop), 64, &r->bg_usc_bo);
+   if (vk != VK_SUCCESS)
+      goto err_loadop;
+
+   /* 2. PDS kick-USC bgnd program [pvr_arch_mrt.c:575]. */
+   fs_data = pco_shader_data(loadop);
+   {
+      struct pvr_pds_kickusc_program kick = { 0 };
+      const pvr_dev_addr_t exec_addr =
+         PVR_DEV_ADDR(r->bg_usc_bo.dev_addr + fs_data->common.entry_offset);
+
+      pvr_pds_setup_doutu(&kick.usc_task_control,
+                          exec_addr.addr,
+                          fs_data->common.temps,
+                          ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE,
+                          fs_data->fs.uses.phase_change);
+      pvr_pds_kick_usc(&kick, NULL, 0, false, PDS_GENERATE_SIZES);
+
+      staging = calloc(kick.code_size + kick.data_size, 4);
+      if (!staging) {
+         vk = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto err_usc_bo;
+      }
+
+      pvr_pds_kick_usc(&kick, staging, 0, false,
+                       PDS_GENERATE_CODEDATA_SEGMENTS);
+
+      /* pvr_gpu_upload_pds layout: data @0 (16B), code right after (16B). */
+      vk = pvrgl_upload(screen, screen->heaps->pds_heap, staging,
+                        PVR_DW_TO_BYTES(kick.data_size + kick.code_size), 16,
+                        &r->bg_pds_frag_bo);
+      free(staging);
+      if (vk != VK_SUCCESS)
+         goto err_usc_bo;
+   }
+
+   r->bg_temps = fs_data->common.temps;
+   ralloc_free(loadop);
+   loadop = NULL;
+
+   /* 3. Clear-color constants: 1 dword (B8G8R8A8 accum) on general heap.
+    *    Keep in sync with the USC clear reg0 value in the frag stream. */
+   {
+      const uint32_t const_data = 0xFF0000FFu; /* red in B8G8R8A8 dword */
+
+      vk = pvrgl_upload(screen, screen->heaps->general_heap, &const_data,
+                        sizeof(const_data), 4, &r->bg_const_bo);
+      if (vk != VK_SUCCESS)
+         goto err_frag_bo;
+   }
+
+   /* 4. DOUTD constants-load program — data-only, no code
+    *    [pvr_arch_cmd_buffer.c:914]. */
+   {
+      struct pvr_pds_pixel_shader_sa_program sa = { 0 };
+
+      sa.num_texture_dma_kicks = 1;
+      pvr_csb_pack (&sa.texture_dma_address[0],
+                    PDSINST_DOUT_FIELDS_DOUTD_SRC0, value) {
+         value.sbase = PVR_DEV_ADDR(r->bg_const_bo.dev_addr);
+      }
+      pvr_csb_pack (&sa.texture_dma_control[0],
+                    PDSINST_DOUT_FIELDS_DOUTD_SRC1, value) {
+         value.dest = ROGUE_PDSINST_DOUTD_DEST_COMMON_STORE;
+         value.bsize = r->bg_shareds_count;
+      }
+
+      pvr_pds_set_sizes_pixel_shader_sa_texture_data(&sa, dev_info);
+      r->bg_tex_data_size = sa.data_size;
+
+      staging = calloc(sa.data_size, 4);
+      if (!staging) {
+         vk = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto err_const_bo;
+      }
+      pvr_pds_generate_pixel_shader_sa_texture_state_data(&sa, staging,
+                                                          dev_info);
+
+      vk = pvrgl_upload(screen, screen->heaps->pds_heap, staging,
+                        PVR_DW_TO_BYTES(sa.data_size), 16,
+                        &r->bg_pds_tex_bo);
+      free(staging);
+      if (vk != VK_SUCCESS)
+         goto err_const_bo;
+   }
+
+   /* 4b. Unitex code program [pvr_arch_mrt.c:526] — 1 texture DMA kick,
+    *    code-only. BGRND0.texunicode_addr points at its code. */
+   {
+      struct pvr_pds_pixel_shader_sa_program ux = { 0 };
+
+      ux.num_texture_dma_kicks = 1;
+      pvr_pds_set_sizes_pixel_shader_uniform_texture_code(&ux);
+
+      staging = calloc(ux.code_size, 4);
+      if (!staging) {
+         vk = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto err_const_bo;
+      }
+      pvr_pds_generate_pixel_shader_sa_code_segment(&ux, staging);
+
+      vk = pvrgl_upload(screen, screen->heaps->pds_heap, staging,
+                        PVR_DW_TO_BYTES(ux.code_size), 16,
+                        &r->bg_pds_unitex_bo);
+      free(staging);
+      if (vk != VK_SUCCESS)
+         goto err_const_bo;
+   }
+
+   /* 5. BGRND reg values [pvr_pds_bgnd_pack_state]. All addresses are FULL
+    *    device addresses (data section start of each upload). */
+   pvr_csb_pack (&r->bgnd_reg_values[0], CR_PDS_BGRND0_BASE, value) {
+      value.shader_addr = PVR_DEV_ADDR(r->bg_pds_frag_bo.dev_addr);
+      value.texunicode_addr = PVR_DEV_ADDR(r->bg_pds_unitex_bo.dev_addr);
+   }
+   pvr_csb_pack (&r->bgnd_reg_values[1], CR_PDS_BGRND1_BASE, value) {
+      value.texturedata_addr = PVR_DEV_ADDR(r->bg_pds_tex_bo.dev_addr);
+   }
+   pvr_csb_pack (&r->bgnd_reg_values[2], CR_PDS_BGRND3_SIZEINFO, value) {
+      value.usc_sharedsize =
+         DIV_ROUND_UP(r->bg_shareds_count,
+                      ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
+      value.pds_texturestatesize =
+         DIV_ROUND_UP(r->bg_tex_data_size,
+                      ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_TEXTURESTATESIZE_UNIT_SIZE);
+      value.pds_tempsize =
+         DIV_ROUND_UP(r->bg_temps,
+                      ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_TEMPSIZE_UNIT_SIZE);
+   }
+
+   mesa_logi("pvrgl: bg-clear ready (usc=%u B tex=%u B temps=%u "
+             "shareds=%u bgrnd3=%016llx)",
+             usc_bin_size, r->bg_tex_data_size * 4, r->bg_temps,
+             r->bg_shareds_count, (unsigned long long)r->bgnd_reg_values[2]);
+
+   return VK_SUCCESS;
+
+err_const_bo:
+   pvrgl_bo_free(screen, &r->bg_const_bo);
+err_frag_bo:
+   pvrgl_bo_free(screen, &r->bg_pds_frag_bo);
+err_usc_bo:
+   pvrgl_bo_free(screen, &r->bg_usc_bo);
+err_loadop:
+   if (loadop)
+      ralloc_free(loadop);
+   return vk;
 }
 
 VkResult
@@ -431,6 +642,12 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
              (unsigned long long)runtime_info->min_free_list_size,
              PVRGL_GLOBAL_FL_INITIAL, (void *)r->rctx);
 
+   /* BG-object clear chain — failure is non-fatal (stream falls back to
+    * zero bgnd, current behavior) but log loudly. */
+   vk = pvrgl_render_bg_clear_init(r);
+   if (vk != VK_SUCCESS)
+      mesa_logw("pvrgl: bg-clear init failed vk=%d (bgnd stays zero)", vk);
+
    *out = r;
    return VK_SUCCESS;
 
@@ -470,10 +687,17 @@ pvrgl_render_fini(struct pvrgl_render *r)
 {
    struct pvrgl_screen *screen = r->screen;
 
+   pvrgl_bo_free(screen, &r->bg_const_bo);
+   pvrgl_bo_free(screen, &r->bg_pds_tex_bo);
+   pvrgl_bo_free(screen, &r->bg_pds_unitex_bo);
+   pvrgl_bo_free(screen, &r->bg_pds_frag_bo);
+   pvrgl_bo_free(screen, &r->bg_usc_bo);
+   pvrgl_bo_free(screen, &r->event_pds_bo);
    pvrgl_bo_free(screen, &r->depth_bias_bo);
    pvrgl_bo_free(screen, &r->scissor_bo);
    pvrgl_bo_free(screen, &r->border_colour_bo);
    pvrgl_bo_free(screen, &r->ctrl_stream_bo);
+   pvrgl_bo_free(screen, &r->event_pds_bo);
    screen->ws->ops->render_ctx_destroy(r->rctx);
    pvrgl_bo_free(screen, &r->vdm_callstack_bo);
    screen->ws->ops->render_target_dataset_destroy(r->rt_dataset);
@@ -554,15 +778,19 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
                        VkFormat rt_format)
 {
    const struct pvr_device_info *dev_info = r->screen->dev_info;
-   /* BXM-4-64 MC1 has NO gpu_multicore_support — mesa's feature table wrongly
-    * claims it (upstream FIXME). Emitting the multicore-gated fields
-    * (isp_oclqry_stride/execute_count) makes the kernel stream parse reject
-    * with EINVAL (trailing data). Kernel truth: pvr_stream_defs.c gates them
-    * on PVR_FEATURE_GPU_MULTICORE_SUPPORT, which is false for this part.
-    * Verified 2026-08-27: full submit dump shows 200B stream vs kernel's
-    * 192B expected. */
-   const bool multicore = false;
-   (void)dev_info;
+   /* BXM-4-64 MC1: the kernel's own feature query reports
+    * gpu_multicore_support=1 (PVRDBG frag_state mc=1, 2026-08-31). The
+    * kernel frag-stream defs (pvr_stream_defs.c) gate isp_oclqry_stride
+    * and execute_count on PVR_FEATURE_GPU_MULTICORE_SUPPORT, so they MUST
+    * be emitted or pvr_stream_process bounds-checks the stream short ->
+    * EINVAL (J11, instrumented-module proof). The 2026-08-27 note
+    * claiming kernel-truth multicore=false was drawn from the TQ
+    * defs (transfer stream has no such fields) and is superseded. */
+   const bool multicore = true;
+   uint32_t isp_tiles_in_flight = 0;
+   uint32_t usc_pixel_output_ctrl = 0;
+   uint32_t event_data_size = 0;
+   VkResult vk_frag;
    struct pvr_pbe_surf_params surf_params;
    struct pvr_pbe_render_params render_params;
    uint32_t pbe_words[ROGUE_NUM_PBESTATE_STATE_WORDS];
@@ -658,6 +886,97 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
                     DWORDS_PER_U64;
    }
 
+   /* ---- Pixel-event PDS program (EOT kicker) [TQ-path port, proven
+    * 2026-08-24 with real TQ pixels; ref pvr_arch_cmd_buffer.c]. At tile
+    * end the FW runs this PDS program: it emits the PBE state words into
+    * USC shared registers (usc_sr_size dwords) and DOUTUs the USC EOT
+    * program (shared_words=true -> EOT reads those SRs). With
+    * const_size=0 / EVENT_PIXEL_PDS_DATA=0 the FW executes nothing and
+    * the EOT never fires -> RT stays zero (the render-submit-passed-
+    * no-pixels symptom). The emit words are THIS submit's pbe_words. */
+   {
+      struct pvr_pds_event_program event_program;
+      struct pvrgl_tq *tq = r->screen->tq_priv;
+      const struct pvrgl_bo *eot_bo = pvrgl_tq_eot_bo(tq, 0);
+      const uint32_t eot_temps = pvrgl_tq_eot_temps(tq, 0);
+      uint32_t *staging;
+      uint32_t code_off;
+
+      if (!eot_bo) {
+         mesa_logw("pvrgl: render EVPDS no EOT program (TQ not ready)");
+      } else {
+      memset(&event_program, 0, sizeof(event_program));
+      event_program.emit_words = pbe_words;
+      event_program.num_emit_word_pairs = 1U;
+
+      pvr_pds_setup_doutu(&event_program.task_control,
+                          eot_bo->heap_offset,
+                          eot_temps,
+                          ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE,
+                          false);
+
+      pvr_pds_set_sizes_pixel_event(&event_program, dev_info);
+
+      event_data_size = event_program.data_size;
+
+      staging = calloc(event_program.code_size + event_program.data_size, 4);
+      if (staging) {
+         pvr_pds_generate_pixel_event_data_segment(&event_program, staging,
+                                                   dev_info);
+         pvr_pds_generate_pixel_event_code_segment(
+            &event_program, staging + event_program.data_size, dev_info);
+
+         /* Code at a 16-byte-aligned offset after the data segment:
+          * EVENT_PIXEL_PDS_CODE addr is a 28-bit shift-4 field (16-byte
+          * units); an unaligned offset truncates on the FW side and it
+          * executes data-segment tail as code (TQ-path gotcha). */
+         code_off = ALIGN_POT(event_program.data_size * 4,
+                              ROGUE_CR_EVENT_PIXEL_PDS_CODE_ADDR_ALIGNMENT);
+
+         if (r->event_pds_bo.bo)
+            pvrgl_bo_free(r->screen, &r->event_pds_bo);
+
+         vk_frag = pvrgl_upload(r->screen,
+                                r->screen->heaps->pds_heap,
+                                staging,
+                                (event_program.code_size +
+                                 event_program.data_size) * 4,
+                                16,
+                                &r->event_pds_bo);
+         if (vk_frag == VK_SUCCESS) {
+            /* Relocate code segment to the aligned offset in the BO. */
+            memcpy((uint8_t *)r->event_pds_bo.bo->map + code_off,
+                   (uint8_t *)r->event_pds_bo.bo->map +
+                      event_program.data_size * 4,
+                   event_program.code_size * 4);
+            mesa_logi("pvrgl: render EVPDS dsize=%u csize=%u code_off=0x%x "
+                      "emit_pairs=%u",
+                      event_program.data_size, event_program.code_size,
+                      code_off, event_program.num_emit_word_pairs);
+         } else {
+            mesa_logw("pvrgl: render EVPDS upload failed %d (EOT dead)",
+                      vk_frag);
+         }
+         free(staging);
+      } else {
+         mesa_logw("pvrgl: render EVPDS staging alloc failed (EOT dead)");
+      }
+      }
+   }
+
+   /* Tiles-in-flight + USC_PIXEL_OUTPUT_CTRL [upstream pvr_arch_job_render.c
+    * :928 — pixel_ctl feeds CR_USC_PIXEL_OUTPUT_CTRL, tiles bits OR into
+    * CR_ISP_CTL]. Our previous zero here starved the USC SR allocation
+    * signal alongside the dead event program. */
+   pvr_arch_setup_tiles_in_flight(dev_info,
+                                  r->screen->runtime_info,
+                                  ROGUE_CR_ISP_AA_MODE_TYPE_AA_NONE,
+                                  1U /* usc_pixel_width: 1 out reg/pixel */,
+                                  false,
+                                  0,
+                                  &isp_tiles_in_flight,
+                                  &usc_pixel_output_ctrl);
+
    pvr_csb_pack ((uint64_t *)stream_ptr, CR_TPU_BORDER_COLOUR_TABLE_PDM,
                  value) {
       value.border_colour_table_address =
@@ -665,31 +984,46 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    }
    stream_ptr += pvr_cmd_length(CR_TPU_BORDER_COLOUR_TABLE_PDM);
 
-   /* CR_PDS_BGRND0/1/3: zero (no load-op; USC clear regs handle the clear).
-    * 3 x u64. */
-   memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
+   /* CR_PDS_BGRND0/1/3: bg-object clear (load-op) program pointers —
+    * built once in pvrgl_render_bg_clear_init(). 3 x u64. Zeros here =
+    * no bgnd program -> ISP never runs the bg task -> empty tiles stay
+    * unwritten regardless of process_empty_tiles. */
+   if (r->bg_pds_frag_bo.bo) {
+      memcpy(stream_ptr, r->bgnd_reg_values, sizeof(r->bgnd_reg_values));
+   } else {
+      memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
+   }
    stream_ptr += 3U * DWORDS_PER_U64;
-   /* PR bgnd: another 3 x u64. */
-   memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
+   /* PR bgnd: same values (upstream fills both for load-op clears). */
+   if (r->bg_pds_frag_bo.bo) {
+      memcpy(stream_ptr, r->bgnd_reg_values, sizeof(r->bgnd_reg_values));
+   } else {
+      memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
+   }
    stream_ptr += 3U * DWORDS_PER_U64;
 
    /* USC clear registers: kernel expects the FULL
     * usc_clear_register[ROGUE_MAXIMUM_OUTPUT_REGISTERS_PER_PIXEL=8] array
     * (8 x u32 = 32B) — PVR_STREAM_DEF_ARRAY consumes sizeof(regs.usc_clear_register).
     * kmd_stream.xml: usc_clear_register size=256 bits. pvrgl emitted only 4
-    * (16B) -> kernel stream parse ran out of data -> EINVAL. Zero all 8
-    * (P1: no color clear via render yet). */
+    * (16B) -> kernel stream parse ran out of data -> EINVAL. Reg0 carries the
+    * clear color (0xFF0000FF = opaque red in B8G8R8A8 dword packing); a
+    * working pipeline must paint non-zero pixels, zero regs would make a
+    * live pipeline indistinguishable from a dead one. */
    {
       uint32_t i;
       for (i = 0; i < 8U; i++) {
          pvr_csb_pack (stream_ptr, CR_USC_CLEAR_REGISTER, reg) {
-            reg.val = 0;
+            reg.val = (i == 0U) ? 0xFF0000FFu : 0;
          }
          stream_ptr += pvr_cmd_length(CR_USC_CLEAR_REGISTER);
       }
    }
 
-   *stream_ptr = 0; /* USC_PIXEL_OUTPUT_CTRL */
+   pvr_csb_pack (stream_ptr, CR_USC_PIXEL_OUTPUT_CTRL, reg) {
+      (void)reg;
+   }
+   *stream_ptr = usc_pixel_output_ctrl;
    stream_ptr += pvr_cmd_length(CR_USC_PIXEL_OUTPUT_CTRL);
 
    pvr_csb_pack (stream_ptr, CR_ISP_BGOBJDEPTH, value) {
@@ -698,7 +1032,9 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    stream_ptr += pvr_cmd_length(CR_ISP_BGOBJDEPTH);
 
    pvr_csb_pack (stream_ptr, CR_ISP_BGOBJVALS, value) {
-      value.enablebgtag = false;
+      /* Upstream full-clear: enable_bg_tag = !!color_init_count (true when
+       * there are color clears) [pvr_arch_cmd_buffer.c:3433]. */
+      value.enablebgtag = true;
       value.mask = true;
       value.stencil = 0;
    }
@@ -711,16 +1047,25 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
 
    pvr_csb_pack (stream_ptr, CR_ISP_CTL, value) {
       value.sample_pos = true;
-      value.process_empty_tiles = false;
+      /* Clear-with-no-geometry: upstream sets process_empty_tiles=true for
+       * clear sub-commands (pvr_arch_cmd_buffer.c:1698). With zero prims,
+       * false makes the ISP skip every tile -> EOT never writes -> zero RT. */
+      value.process_empty_tiles = true;
       if (multicore)
          value.skip_init_hdrs = true;
    }
+   /* Tiles-in-flight bits live in CR_ISP_CTL [TQ-path pattern]. */
+   *stream_ptr |= isp_tiles_in_flight;
    stream_ptr += pvr_cmd_length(CR_ISP_CTL);
 
    pvr_csb_pack (stream_ptr, CR_EVENT_PIXEL_PDS_INFO, value) {
-      value.const_size = 0;
       value.temp_stride = 0;
-      value.usc_sr_size = 1;
+      value.const_size =
+         DIV_ROUND_UP(event_data_size,
+                      ROGUE_CR_EVENT_PIXEL_PDS_INFO_CONST_SIZE_UNIT_SIZE);
+      value.usc_sr_size =
+         DIV_ROUND_UP(1U * PVR_STATE_PBE_DWORDS,
+                      ROGUE_CR_EVENT_PIXEL_PDS_INFO_USC_SR_SIZE_UNIT_SIZE);
    }
    stream_ptr += pvr_cmd_length(CR_EVENT_PIXEL_PDS_INFO);
 
@@ -730,7 +1075,7 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    stream_ptr += pvr_cmd_length(KMD_STREAM_VIEW_IDX);
 
    pvr_csb_pack (stream_ptr, CR_EVENT_PIXEL_PDS_DATA, value) {
-      value.addr = PVR_DEV_ADDR(0U);
+      value.addr = PVR_DEV_ADDR(r->event_pds_bo.heap_offset);
    }
    stream_ptr += pvr_cmd_length(CR_EVENT_PIXEL_PDS_DATA);
 
@@ -823,6 +1168,30 @@ pvrgl_render_selftest(struct pvrgl_screen *screen)
       goto out_fini;
 
    vk = pvrgl_render_test_submit(r, &rt_bo, VK_FORMAT_B8G8R8A8_UNORM);
+   if (vk == VK_SUCCESS) {
+      /* Pixel verdict: the FW executes asynchronously — poll the RT map
+       * for the first non-zero dword for up to 2s, then report position
+       * and value. All-zero after the window = EOT/PBE still dead. */
+      volatile const uint32_t *pix = (volatile const uint32_t *)rt_bo.bo->map;
+      const size_t n = (size_t)PVRGL_RT_WIDTH * PVRGL_RT_HEIGHT;
+      unsigned spin;
+      bool nonzero = false;
+
+      for (spin = 0; spin < 200 && !nonzero; spin++) {
+         for (size_t i = 0; i < n; i++) {
+            if (pix[i]) {
+               mesa_logi("pvrgl: RENDER PIXELS %08x at (%zu,%zu) off=%zu",
+                         pix[i], i % PVRGL_RT_WIDTH, i / PVRGL_RT_WIDTH, i);
+               nonzero = true;
+               break;
+            }
+         }
+         if (!nonzero)
+            usleep(10000);
+      }
+      if (!nonzero)
+         mesa_logw("pvrgl: RENDER PIXELS all zero after 2s");
+   }
 
    pvrgl_bo_free(screen, &rt_bo);
 out_fini:
