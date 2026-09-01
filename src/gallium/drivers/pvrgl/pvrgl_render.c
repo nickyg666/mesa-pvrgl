@@ -97,6 +97,22 @@ struct pvrgl_render {
    struct pvrgl_bo bg_pds_unitex_bo; /* PDS unitex code prog (texunicode). */
    struct pvrgl_bo bg_const_bo;     /* clear-color dword (general heap). */
    uint64_t bgnd_reg_values[3];
+
+   /* Render-context switch state (LLS buffers + PDS store/resume programs),
+    * mirrors upstream pvr_render_ctx_switch_init() [pvr_arch_job_context.c].
+    * The FW runs the geom ctx store/resume tasks on every job; with zeroed
+    * base addrs it targets addr 0 -> DM_GEOM GUILTY_LOCKUP (2026-08-31). */
+   struct pvrgl_bo vdm_state_bo;      /* LLS VDM resume buffer (general). */
+   struct pvrgl_bo geom_state_bo;     /* LLS TA state buffer (general). */
+   struct pvrgl_bo usc_store_bo;      /* CS_STORE_SR usc blob (usc heap). */
+   struct pvrgl_bo usc_load_bo;       /* CS_LOAD_SR usc blob (usc heap). */
+   struct pvrgl_bo sr_store_load_bo;  /* shared-regs state (pds heap). */
+   struct pvrgl_bo pt_store_resume_bo;/* PT persistent temps (pds heap). */
+   struct pvrgl_bo pt_store_prog_bo;
+   struct pvrgl_bo pt_resume_prog_bo;
+   struct pvrgl_bo sr_store_prog_bo;
+   struct pvrgl_bo sr_load_prog_bo;
+   struct pvr_pds_upload pt_store_up, pt_resume_up, sr_store_up, sr_load_up;
    uint32_t bg_temps;          /* USC temps (BGRND3.pds_tempsize). */
    uint32_t bg_tex_data_size;  /* DOUTD prog data size dwords (BGRND3). */
    uint32_t bg_shareds_count;  /* consts dwords (BGRND3.usc_sharedsize). */
@@ -559,6 +575,102 @@ pvrgl_render_bind_target(struct pvrgl_render *r, uint32_t width, uint32_t height
    return VK_SUCCESS;
 }
 
+#define PVRGL_PDS_TASK_PROGRAM_SIZE 256U
+
+/* ---- Context-switch program staging (upstream pvr_gpu_upload_pds
+ * semantics with pvrgl_upload: [data | pad | code] in one pds-heap BO,
+ * offsets heap-relative bytes, sizes dwords). ---- */
+static VkResult
+pvrgl_pds_prog_upload(struct pvrgl_screen *screen,
+                      const uint32_t *data, uint32_t data_size_dw,
+                      uint32_t data_align,
+                      const uint32_t *code, uint32_t code_size_dw,
+                      uint32_t code_align,
+                      uint64_t min_align,
+                      struct pvr_pds_upload *up, struct pvrgl_bo *bo_out)
+{
+   const size_t data_size = (size_t)data_size_dw * 4;
+   const size_t code_size = (size_t)code_size_dw * 4;
+   const uint64_t data_aligned = ALIGN_POT(data_size, data_align);
+   const uint64_t code_aligned = ALIGN_POT(code_size, code_align);
+   const uint32_t code_off = ALIGN_POT(data_aligned, code_align);
+   const uint64_t bo_align = MAX2(min_align, data_align);
+   const uint64_t bo_size = code ? (code_off + code_aligned) : data_aligned;
+   uint32_t *stage;
+   VkResult vk;
+
+   stage = calloc(1, bo_size);
+   if (!stage)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   if (data)
+      memcpy(stage, data, data_size);
+   if (code)
+      memcpy((uint8_t *)stage + code_off, code, code_size);
+
+   vk = pvrgl_upload(screen, screen->heaps->pds_heap, stage,
+                     bo_size, bo_align, bo_out);
+   free(stage);
+   if (vk != VK_SUCCESS)
+      return vk;
+
+   up->data_offset = bo_out->heap_offset;
+   up->data_size = data_aligned / 4;
+   up->code_offset = bo_out->heap_offset + code_off;
+   up->code_size = code_aligned / 4;
+   return VK_SUCCESS;
+}
+
+/* Upstream pvr_pds_ctx_sr_program_setup() [pvr_arch_job_context.c:281]. */
+static void
+pvrgl_ctx_sr_setup(uint64_t usc_program_upload_offset, uint8_t usc_temps,
+                   uint64_t sr_addr,
+                   struct pvr_pds_shared_storing_program *program_out)
+{
+   *program_out = (struct pvr_pds_shared_storing_program){
+      .cc_enable = false,
+      .doutw_control = {
+         .dest_store = PDS_UNIFIED_STORE,
+         .num_const64 = 2,
+         .doutw_data = {
+            [0] = sr_addr,
+            [1] = sr_addr + ROGUE_LLS_SHARED_REGS_RESERVE_SIZE,
+         },
+         .last_instruction = false,
+      },
+   };
+
+   pvr_pds_setup_doutu(&program_out->usc_task.usc_task_control,
+                       usc_program_upload_offset, usc_temps,
+                       ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE, false);
+}
+
+/* Upstream pvr_rogue_get_vdmctrl_pds_state_words() [pvr_arch_job_context.c]. */
+static void
+pvrgl_vdmctrl_pds_state_words(const struct pvr_pds_upload *pds_program,
+                              enum ROGUE_VDMCTRL_USC_TARGET usc_target,
+                              uint8_t usc_unified_size,
+                              uint32_t *state0_out, uint32_t *state1_out)
+{
+   pvr_csb_pack (state0_out, VDMCTRL_PDS_STATE0, state) {
+      const uint32_t pds_data_size = PVR_DW_TO_BYTES(pds_program->data_size);
+
+      state.dm_target = ROGUE_VDMCTRL_DM_TARGET_VDM;
+      state.usc_target = usc_target;
+      state.usc_common_size = 0;
+      state.usc_unified_size = usc_unified_size;
+      state.pds_temp_size = 0;
+      state.pds_data_size =
+         pds_data_size / ROGUE_VDMCTRL_PDS_STATE0_PDS_DATA_SIZE_UNIT_SIZE;
+   }
+
+   pvr_csb_pack (state1_out, VDMCTRL_PDS_STATE1, state) {
+      state.pds_data_addr = PVR_DEV_ADDR(pds_program->data_offset);
+      state.sd_type = ROGUE_VDMCTRL_SD_TYPE_PDS;
+      state.sd_next_type = ROGUE_VDMCTRL_SD_TYPE_PDS;
+   }
+}
+
 VkResult
 pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
 {
@@ -657,11 +769,267 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
       if (vk != VK_SUCCESS)
          goto err_vheap;
 
-      memset(&rctx_info, 0, sizeof(rctx_info));
-      rctx_info.priority = PVR_WINSYS_CTX_PRIORITY_MEDIUM;
-      rctx_info.vdm_callstack_addr.addr = r->vdm_callstack_bo.dev_addr;
-      rctx_info.static_state.rogue.vdm_ctx_state_base_addr = 0;
-      rctx_info.static_state.rogue.geom_ctx_state_base_addr = 0;
+      /* ---- Context-switch LLS buffers + PDS store/resume programs. ---- */
+      const pco_precomp_data *sr_store_pre =
+         (const pco_precomp_data *)pco_usclib_common[CS_STORE_SR_1024_COMMON];
+      const pco_precomp_data *sr_load_pre =
+         (const pco_precomp_data *)pco_usclib_common[CS_LOAD_SR_256_COMMON];
+      uint64_t usc_store_off, usc_load_off;
+
+      vk = pvrgl_upload(screen, screen->heaps->general_heap, NULL,
+                        ROGUE_LLS_VDM_CONTEXT_RESUME_BUFFER_SIZE,
+                        ROGUE_LLS_VDM_CONTEXT_RESUME_BUFFER_ALIGNMENT,
+                        &r->vdm_state_bo);
+      if (vk != VK_SUCCESS)
+         goto err_callstack;
+
+      vk = pvrgl_upload(screen, screen->heaps->general_heap, NULL,
+                        ROGUE_LLS_TA_STATE_BUFFER_SIZE,
+                        ROGUE_LLS_TA_STATE_BUFFER_ALIGNMENT,
+                        &r->geom_state_bo);
+      if (vk != VK_SUCCESS)
+         goto err_vdm_state;
+
+      vk = pvrgl_upload(screen, screen->heaps->usc_heap,
+                        sr_store_pre->binary,
+                        sr_store_pre->size_dwords * sizeof(uint32_t),
+                        cache_line_size, &r->usc_store_bo);
+      if (vk != VK_SUCCESS)
+         goto err_geom_state;
+
+      vk = pvrgl_upload(screen, screen->heaps->usc_heap,
+                        sr_load_pre->binary,
+                        sr_load_pre->size_dwords * sizeof(uint32_t),
+                        cache_line_size, &r->usc_load_bo);
+      if (vk != VK_SUCCESS)
+         goto err_usc_store;
+
+      usc_store_off = r->usc_store_bo.dev_addr -
+                      screen->heaps->usc_heap->base_addr.addr;
+      usc_load_off = r->usc_load_bo.dev_addr -
+                     screen->heaps->usc_heap->base_addr.addr;
+
+      vk = pvrgl_upload(screen, screen->heaps->pds_heap, NULL,
+                        ROGUE_LLS_USC_SHARED_REGS_BUFFER_SIZE +
+                           ROGUE_LLS_SHARED_REGS_RESERVE_SIZE,
+                        cache_line_size, &r->sr_store_load_bo);
+      if (vk != VK_SUCCESS)
+         goto err_usc_load;
+
+      vk = pvrgl_upload(screen, screen->heaps->pds_heap, NULL,
+                        ROGUE_LLS_PDS_PERSISTENT_TEMPS_BUFFER_SIZE,
+                        ROGUE_LLS_PDS_PERSISTENT_TEMPS_BUFFER_ALIGNMENT,
+                        &r->pt_store_resume_bo);
+      if (vk != VK_SUCCESS)
+         goto err_sr_state;
+
+      /* PT store (stream_out_terminate). */
+      {
+         struct pvr_pds_stream_out_terminate_program program = { 0 };
+         uint32_t *staging, *code;
+         size_t staging_size;
+
+         program.pds_persistent_temp_size_to_store =
+            ROGUE_LLS_PDS_PERSISTENT_TEMPS_BUFFER_SIZE / 4;
+         program.dev_address_for_storing_persistent_temp =
+            r->pt_store_resume_bo.dev_addr;
+
+         pvr_pds_generate_stream_out_terminate_program(
+            &program, NULL, PDS_GENERATE_SIZES, dev_info);
+
+         staging_size = (program.stream_out_terminate_pds_data_size +
+                         program.stream_out_terminate_pds_code_size) *
+                        sizeof(*staging);
+         staging = calloc(1, staging_size);
+         if (!staging) {
+            vk = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto err_pt_state;
+         }
+         code = pvr_pds_generate_stream_out_terminate_program(
+            &program, staging, PDS_GENERATE_DATA_SEGMENT, dev_info);
+         pvr_pds_generate_stream_out_terminate_program(
+            &program, code, PDS_GENERATE_CODE_SEGMENT, dev_info);
+
+         vk = pvrgl_pds_prog_upload(
+            screen, staging, program.stream_out_terminate_pds_data_size,
+            ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
+            code, program.stream_out_terminate_pds_code_size,
+            ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
+            cache_line_size, &r->pt_store_up, &r->pt_store_prog_bo);
+         free(staging);
+         if (vk != VK_SUCCESS)
+            goto err_pt_state;
+      }
+
+      /* PT resume (stream_out_init). */
+      {
+         struct pvr_pds_stream_out_init_program program = { 0 };
+         uint32_t *staging, *code;
+         size_t staging_size;
+
+         program.num_buffers = 1;
+         program.pds_buffer_data_size[0] =
+            ROGUE_LLS_PDS_PERSISTENT_TEMPS_BUFFER_SIZE / 4;
+         program.dev_address_for_buffer_data[0] =
+            r->pt_store_resume_bo.dev_addr;
+
+         pvr_pds_generate_stream_out_init_program(
+            &program, NULL, false, PDS_GENERATE_SIZES, dev_info);
+
+         staging_size = (program.stream_out_init_pds_data_size +
+                         program.stream_out_init_pds_code_size) *
+                        sizeof(*staging);
+         staging = calloc(1, staging_size);
+         if (!staging) {
+            vk = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto err_pt_store;
+         }
+         code = pvr_pds_generate_stream_out_init_program(
+            &program, staging, false, PDS_GENERATE_DATA_SEGMENT, dev_info);
+         pvr_pds_generate_stream_out_init_program(
+            &program, code, false, PDS_GENERATE_CODE_SEGMENT, dev_info);
+
+         vk = pvrgl_pds_prog_upload(
+            screen, staging, program.stream_out_init_pds_data_size,
+            ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
+            code, program.stream_out_init_pds_code_size,
+            ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
+            cache_line_size, &r->pt_resume_up, &r->pt_resume_prog_bo);
+         free(staging);
+         if (vk != VK_SUCCESS)
+            goto err_pt_store;
+      }
+
+      /* SR store/load PDS programs (DOUTU-kick the USC store/load blobs). */
+      {
+         struct pvr_pds_shared_storing_program program;
+         uint32_t staging[PVRGL_PDS_TASK_PROGRAM_SIZE / 4U] = { 0 };
+         uint32_t code_off;
+
+         /* BXM-4-64 MC1: single core (the core_count>1 path is a
+          * pvr_finishme upstream too). */
+         pvrgl_ctx_sr_setup(usc_store_off, sr_store_pre->temps,
+                            r->sr_store_load_bo.dev_addr, &program);
+         pvr_pds_generate_shared_storing_program(
+            &program, staging, PDS_GENERATE_DATA_SEGMENT, dev_info);
+         code_off = ALIGN_POT(
+            program.data_size,
+            ROGUE_VDMCTRL_PDS_STATE1_PDS_DATA_ADDR_ALIGNMENT / 4U);
+         pvr_pds_generate_shared_storing_program(
+            &program, staging + code_off, PDS_GENERATE_CODE_SEGMENT, dev_info);
+
+         vk = pvrgl_pds_prog_upload(
+            screen, staging, program.data_size,
+            ROGUE_VDMCTRL_PDS_STATE1_PDS_DATA_ADDR_ALIGNMENT,
+            staging + code_off, program.code_size,
+            ROGUE_VDMCTRL_PDS_STATE2_PDS_CODE_ADDR_ALIGNMENT,
+            cache_line_size, &r->sr_store_up, &r->sr_store_prog_bo);
+         if (vk != VK_SUCCESS)
+            goto err_pt_resume;
+
+         memset(staging, 0, sizeof(staging));
+         pvrgl_ctx_sr_setup(usc_load_off, sr_load_pre->temps,
+                            r->sr_store_load_bo.dev_addr, &program);
+         pvr_pds_generate_shared_storing_program(
+            &program, staging, PDS_GENERATE_DATA_SEGMENT, dev_info);
+         code_off = ALIGN_POT(
+            program.data_size,
+            ROGUE_VDMCTRL_PDS_STATE1_PDS_DATA_ADDR_ALIGNMENT / 4U);
+         pvr_pds_generate_shared_storing_program(
+            &program, staging + code_off, PDS_GENERATE_CODE_SEGMENT, dev_info);
+
+         vk = pvrgl_pds_prog_upload(
+            screen, staging, program.data_size,
+            ROGUE_VDMCTRL_PDS_STATE1_PDS_DATA_ADDR_ALIGNMENT,
+            staging + code_off, program.code_size,
+            ROGUE_VDMCTRL_PDS_STATE2_PDS_CODE_ADDR_ALIGNMENT,
+            cache_line_size, &r->sr_load_up, &r->sr_load_prog_bo);
+         if (vk != VK_SUCCESS)
+            goto err_sr_store;
+      }
+
+      /* ---- Context priority + callstack address (must be set, not left
+       * uninitialized — kernel rejects CREATE_CONTEXT with garbage). ---- */
+      rctx_info.priority = 0;
+      rctx_info.vdm_callstack_addr = PVR_DEV_ADDR(r->vdm_callstack_bo.dev_addr);
+
+      /* ---- Fill the winsys static state (upstream
+       * pvr_render_ctx_ws_static_state_init). ---- */
+      {
+         const uint8_t usc_unified_size =
+            DIV_ROUND_UP(64, ROGUE_VDMCTRL_PDS_STATE0_USC_UNIFIED_SIZE_UNIT_SIZE);
+         pvr_csb_pack (&rctx_info.static_state.rogue.vdm_ctx_state_base_addr,
+                       CR_VDM_CONTEXT_STATE_BASE, base) {
+            base.addr = PVR_DEV_ADDR(r->vdm_state_bo.dev_addr);
+         }
+         pvr_csb_pack (&rctx_info.static_state.rogue.geom_ctx_state_base_addr,
+                       CR_TA_CONTEXT_STATE_BASE, base) {
+            base.addr = PVR_DEV_ADDR(r->geom_state_bo.dev_addr);
+         }
+
+         for (uint32_t i = 0; i < 2; i++) {
+            uint64_t *q = &rctx_info.static_state.rogue.geom_state[i].vdm_ctx_store_task0;
+            uint32_t *d = &rctx_info.static_state.rogue.geom_state[i].vdm_ctx_store_task1;
+
+            pvr_csb_pack (q, CR_VDM_CONTEXT_STORE_TASK0, task0) {
+               pvrgl_vdmctrl_pds_state_words(&r->sr_store_up,
+                                             ROGUE_VDMCTRL_USC_TARGET_ANY,
+                                             usc_unified_size,
+                                             &task0.pds_state0,
+                                             &task0.pds_state1);
+            }
+            pvr_csb_pack (d, CR_VDM_CONTEXT_STORE_TASK1, task1) {
+               pvr_csb_pack (&task1.pds_state2, VDMCTRL_PDS_STATE2, state) {
+                  state.pds_code_addr =
+                     PVR_DEV_ADDR(r->sr_store_up.code_offset);
+               }
+            }
+            q = &rctx_info.static_state.rogue.geom_state[i].vdm_ctx_store_task2;
+            pvr_csb_pack (q, CR_VDM_CONTEXT_STORE_TASK2, task2) {
+               pvr_csb_pack (&task2.stream_out1, TA_STATE_STREAM_OUT1, so1) {
+                  so1.sync = true;
+                  so1.pds_data_size =
+                     PVR_DW_TO_BYTES(r->pt_store_up.data_size) /
+                     ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE;
+                  so1.pds_temp_size = 0;
+               }
+               pvr_csb_pack (&task2.stream_out2, TA_STATE_STREAM_OUT2, so2) {
+                  so2.pds_data_addr =
+                     PVR_DEV_ADDR(r->pt_store_up.data_offset);
+               }
+            }
+
+            q = &rctx_info.static_state.rogue.geom_state[i].vdm_ctx_resume_task0;
+            pvr_csb_pack (q, CR_VDM_CONTEXT_RESUME_TASK0, task0) {
+               pvrgl_vdmctrl_pds_state_words(&r->sr_load_up,
+                                             ROGUE_VDMCTRL_USC_TARGET_ALL,
+                                             usc_unified_size,
+                                             &task0.pds_state0,
+                                             &task0.pds_state1);
+            }
+            d = &rctx_info.static_state.rogue.geom_state[i].vdm_ctx_resume_task1;
+            pvr_csb_pack (d, CR_VDM_CONTEXT_RESUME_TASK1, task1) {
+               pvr_csb_pack (&task1.pds_state2, VDMCTRL_PDS_STATE2, state) {
+                  state.pds_code_addr =
+                     PVR_DEV_ADDR(r->sr_load_up.code_offset);
+               }
+            }
+            q = &rctx_info.static_state.rogue.geom_state[i].vdm_ctx_resume_task2;
+            pvr_csb_pack (q, CR_VDM_CONTEXT_RESUME_TASK2, task2) {
+               pvr_csb_pack (&task2.stream_out1, TA_STATE_STREAM_OUT1, so1) {
+                  so1.sync = true;
+                  so1.pds_data_size =
+                     PVR_DW_TO_BYTES(r->pt_resume_up.data_size) /
+                     ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE;
+                  so1.pds_temp_size = 0;
+               }
+               pvr_csb_pack (&task2.stream_out2, TA_STATE_STREAM_OUT2, so2) {
+                  so2.pds_data_addr =
+                     PVR_DEV_ADDR(r->pt_resume_up.data_offset);
+               }
+            }
+         }
+      }
 
       vk = screen->ws->ops->render_ctx_create(screen->ws, &rctx_info,
                                               dev_info, &r->rctx);
@@ -696,6 +1064,8 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
    vk = pvrgl_render_bg_clear_init(r);
    if (vk != VK_SUCCESS)
       mesa_logw("pvrgl: bg-clear init failed vk=%d (bgnd stays zero)", vk);
+   else
+      mesa_logi("pvrgl: bg-clear init ok");
 
    /* ORDER EXPERIMENT: create the dataset before first submit, matching
     * the pre-refactor init order (dataset existed at rctx-create time). */
@@ -716,6 +1086,24 @@ err_ctrl:
    pvrgl_bo_free(screen, &r->ctrl_stream_bo);
 err_rctx:
    screen->ws->ops->render_ctx_destroy(r->rctx);
+err_sr_store:
+   pvrgl_bo_free(screen, &r->sr_store_prog_bo);
+err_pt_resume:
+   pvrgl_bo_free(screen, &r->pt_resume_prog_bo);
+err_pt_store:
+   pvrgl_bo_free(screen, &r->pt_store_prog_bo);
+err_pt_state:
+   pvrgl_bo_free(screen, &r->pt_store_resume_bo);
+err_sr_state:
+   pvrgl_bo_free(screen, &r->sr_store_load_bo);
+err_usc_load:
+   pvrgl_bo_free(screen, &r->usc_load_bo);
+err_usc_store:
+   pvrgl_bo_free(screen, &r->usc_store_bo);
+err_geom_state:
+   pvrgl_bo_free(screen, &r->geom_state_bo);
+err_vdm_state:
+   pvrgl_bo_free(screen, &r->vdm_state_bo);
 err_callstack:
    pvrgl_bo_free(screen, &r->vdm_callstack_bo);
 err_vheap:
@@ -746,6 +1134,16 @@ pvrgl_render_fini(struct pvrgl_render *r)
    pvrgl_bo_free(screen, &r->scissor_bo);
    pvrgl_bo_free(screen, &r->border_colour_bo);
    pvrgl_bo_free(screen, &r->ctrl_stream_bo);
+   pvrgl_bo_free(screen, &r->sr_load_prog_bo);
+   pvrgl_bo_free(screen, &r->sr_store_prog_bo);
+   pvrgl_bo_free(screen, &r->pt_resume_prog_bo);
+   pvrgl_bo_free(screen, &r->pt_store_prog_bo);
+   pvrgl_bo_free(screen, &r->pt_store_resume_bo);
+   pvrgl_bo_free(screen, &r->sr_store_load_bo);
+   pvrgl_bo_free(screen, &r->usc_load_bo);
+   pvrgl_bo_free(screen, &r->usc_store_bo);
+   pvrgl_bo_free(screen, &r->geom_state_bo);
+   pvrgl_bo_free(screen, &r->vdm_state_bo);
    screen->ws->ops->render_ctx_destroy(r->rctx);
    pvrgl_bo_free(screen, &r->vdm_callstack_bo);
    if (r->rt_dataset)
@@ -839,6 +1237,7 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
     * defs (transfer stream has no such fields) and is superseded. */
    const bool multicore = true;
    uint32_t isp_tiles_in_flight = 0;
+   uint32_t code_off = 0;
    uint32_t usc_pixel_output_ctrl = 0;
    uint32_t event_data_size = 0;
    VkResult vk_frag;
@@ -951,67 +1350,83 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
       const struct pvrgl_bo *eot_bo = pvrgl_tq_eot_bo(tq, 0);
       const uint32_t eot_temps = pvrgl_tq_eot_temps(tq, 0);
       uint32_t *staging;
-      uint32_t code_off;
+      VkResult vk_frag;
 
       if (!eot_bo) {
          mesa_logw("pvrgl: render EVPDS no EOT program (TQ not ready)");
       } else {
-      memset(&event_program, 0, sizeof(event_program));
-      event_program.emit_words = pbe_words;
-      event_program.num_emit_word_pairs = 1U;
+         mesa_logi("pvrgl: render EVPDS eot_bo dev=%llx heap=%llx event_pd dev=%llx heap=%llx temps=%u",
+                    (unsigned long long)eot_bo->dev_addr,
+                    (unsigned long long)eot_bo->heap_offset,
+                    (unsigned long long)r->event_pds_bo.dev_addr,
+                    (unsigned long long)r->event_pds_bo.heap_offset,
+                    eot_temps);
 
-      pvr_pds_setup_doutu(&event_program.task_control,
-                          eot_bo->heap_offset,
-                          eot_temps,
-                          ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE,
-                          false);
+         /* Allocate the event_pds_bo FIRST so we know its dev_addr.
+          * pvr_pds_setup_doutu must be called with the event_pds_bo's
+          * dev_addr + code_off as the DOUTU execution_address, NOT
+          * eot_bo->heap_offset. The TQ EOT BO's heap_offset (0x1000)
+          * is the wrong address — the DOUTU must execute the EOT PDS
+          * program from the event_pds_bo code segment. */
+         {
+            if (r->event_pds_bo.bo)
+               pvrgl_bo_free(r->screen, &r->event_pds_bo);
 
-      pvr_pds_set_sizes_pixel_event(&event_program, dev_info);
+            const uint32_t est_size = 64; /* upper bound for EOT program */
+            vk_frag = pvrgl_upload(r->screen,
+                                   r->screen->heaps->pds_heap,
+                                   NULL, est_size, 16, &r->event_pds_bo);
+            if (vk_frag != VK_SUCCESS) {
+               mesa_logw("pvrgl: render EVPDS alloc failed %d (EOT dead)", vk_frag);
+            } else {
+               /* Set up sizes FIRST to get data_size/code_size,
+                * then calculate code_off, THEN set up DOUTU with
+                * the correct code-segment execution address. */
+               memset(&event_program, 0, sizeof(event_program));
+               event_program.emit_words = pbe_words;
+               event_program.num_emit_word_pairs = 1U;
 
-      event_data_size = event_program.data_size;
+               /* Sizes must come BEFORE pvr_pds_setup_doutu so we
+                * can calculate code_off for the execution address. */
+               pvr_pds_set_sizes_pixel_event(&event_program, dev_info);
+               event_data_size = event_program.data_size;
 
-      staging = calloc(event_program.code_size + event_program.data_size, 4);
-      if (staging) {
-         pvr_pds_generate_pixel_event_data_segment(&event_program, staging,
-                                                   dev_info);
-         pvr_pds_generate_pixel_event_code_segment(
-            &event_program, staging + event_program.data_size, dev_info);
+               code_off = ALIGN_POT(event_program.data_size * 4,
+                                      ROGUE_CR_EVENT_PIXEL_PDS_CODE_ADDR_ALIGNMENT);
 
-         /* Code at a 16-byte-aligned offset after the data segment:
-          * EVENT_PIXEL_PDS_CODE addr is a 28-bit shift-4 field (16-byte
-          * units); an unaligned offset truncates on the FW side and it
-          * executes data-segment tail as code (TQ-path gotcha). */
-         code_off = ALIGN_POT(event_program.data_size * 4,
-                              ROGUE_CR_EVENT_PIXEL_PDS_CODE_ADDR_ALIGNMENT);
+               /* DOUTU execution_address = code segment start (heap_offset + code_off),
+                * NOT the BO base dev_addr. Same as CR_EVENT_PIXEL_PDS_DATA/CODE —
+                * the FW expects heap-relative offsets for these PDS addresses. */
+               pvr_pds_setup_doutu(&event_program.task_control,
+                                     r->event_pds_bo.heap_offset + code_off,
+                                     eot_temps,
+                                     ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE,
+                                     false);
 
-         if (r->event_pds_bo.bo)
-            pvrgl_bo_free(r->screen, &r->event_pds_bo);
+               staging = calloc(event_program.code_size + event_program.data_size, 4);
+               if (staging) {
+                  pvr_pds_generate_pixel_event_data_segment(&event_program, staging, dev_info);
+                  pvr_pds_generate_pixel_event_code_segment(
+                     &event_program, staging + event_program.data_size, dev_info);
 
-         vk_frag = pvrgl_upload(r->screen,
-                                r->screen->heaps->pds_heap,
-                                staging,
-                                (event_program.code_size +
-                                 event_program.data_size) * 4,
-                                16,
-                                &r->event_pds_bo);
-         if (vk_frag == VK_SUCCESS) {
-            /* Relocate code segment to the aligned offset in the BO. */
-            memcpy((uint8_t *)r->event_pds_bo.bo->map + code_off,
-                   (uint8_t *)r->event_pds_bo.bo->map +
-                      event_program.data_size * 4,
-                   event_program.code_size * 4);
-            mesa_logi("pvrgl: render EVPDS dsize=%u csize=%u code_off=0x%x "
-                      "emit_pairs=%u",
-                      event_program.data_size, event_program.code_size,
-                      code_off, event_program.num_emit_word_pairs);
-         } else {
-            mesa_logw("pvrgl: render EVPDS upload failed %d (EOT dead)",
-                      vk_frag);
+                  /* Copy data+code into the already-allocated BO */
+                  memcpy((uint8_t *)r->event_pds_bo.bo->map,
+                         staging,
+                         event_program.data_size * 4);
+                  memcpy((uint8_t *)r->event_pds_bo.bo->map + code_off,
+                         staging + event_program.data_size * 4,
+                         event_program.code_size * 4);
+
+                  mesa_logi("pvrgl: render EVPDS fixed dev_addr=%llx+0x%x dsize=%u csize=%u code_off=0x%x emit_pairs=%u",
+                             (unsigned long long)r->event_pds_bo.dev_addr, code_off,
+                             event_program.data_size, event_program.code_size,
+                             code_off, event_program.num_emit_word_pairs);
+               } else {
+                  mesa_logw("pvrgl: render EVPDS staging alloc failed (EOT dead)");
+               }
+               free(staging);
+            }
          }
-         free(staging);
-      } else {
-         mesa_logw("pvrgl: render EVPDS staging alloc failed (EOT dead)");
-      }
       }
    }
 
@@ -1126,9 +1541,19 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    stream_ptr += pvr_cmd_length(KMD_STREAM_VIEW_IDX);
 
    pvr_csb_pack (stream_ptr, CR_EVENT_PIXEL_PDS_DATA, value) {
+      /* PDS task data addr is a 28-bit heap offset (shift=4),
+       * NOT the full device address — same as the TQ path.
+       * Passing dev_addr truncated to garbage causes FW jump fault. */
       value.addr = PVR_DEV_ADDR(r->event_pds_bo.heap_offset);
    }
    stream_ptr += pvr_cmd_length(CR_EVENT_PIXEL_PDS_DATA);
+
+   pvr_csb_pack (stream_ptr, CR_EVENT_PIXEL_PDS_CODE, value) {
+      /* Code segment addr is a 28-bit heap offset (shift=4).
+       * code_off is the byte offset of the code segment within the BO. */
+      value.addr = PVR_DEV_ADDR(r->event_pds_bo.heap_offset + code_off);
+   }
+   stream_ptr += pvr_cmd_length(CR_EVENT_PIXEL_PDS_CODE);
 
    if (multicore) {
       *stream_ptr = 0; /* isp_oclqry_stride */
