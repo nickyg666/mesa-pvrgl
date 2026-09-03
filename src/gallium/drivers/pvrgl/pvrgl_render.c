@@ -1457,22 +1457,17 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    }
    stream_ptr += pvr_cmd_length(CR_TPU_BORDER_COLOUR_TABLE_PDM);
 
-   /* CR_PDS_BGRND0/1/3: bg-object clear (load-op) program pointers —
-    * built once in pvrgl_render_bg_clear_init(). 3 x u64. Zeros here =
-    * no bgnd program -> ISP never runs the bg task -> empty tiles stay
-    * unwritten regardless of process_empty_tiles. */
-   if (r->bg_pds_frag_bo.bo) {
-      memcpy(stream_ptr, r->bgnd_reg_values, sizeof(r->bgnd_reg_values));
-   } else {
-      memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
-   }
+   /* CR_PDS_BGRND0/1/3: bg-object clear (load-op) program pointers. The
+    * M3-bisect (2026-09-03) found: when bg_pds_frag_bo is set, the kernel
+    * runs the bgnd chain — but the chain's USC program at the DOUTD target
+    * is misaligned, the EOT never fires, RT stays zero. Strip to zero
+    * (TQ-style no-shader clear path: ISP does the clear via ISP_BGOBJVALS
+    * + usc_clear_register0). */
+   memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
    stream_ptr += 3U * DWORDS_PER_U64;
-   /* PR bgnd: same values (upstream fills both for load-op clears). */
-   if (r->bg_pds_frag_bo.bo) {
-      memcpy(stream_ptr, r->bgnd_reg_values, sizeof(r->bgnd_reg_values));
-   } else {
-      memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
-   }
+   /* PR bgnd: same (TQ path zeros both, kernel stream parse expects the
+    * two bgnd blocks regardless). */
+   memset(stream_ptr, 0, 3U * DWORDS_PER_U64 * sizeof(uint32_t));
    stream_ptr += 3U * DWORDS_PER_U64;
 
    /* USC clear registers: kernel expects the FULL
@@ -1519,13 +1514,15 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    stream_ptr += pvr_cmd_length(CR_ISP_AA);
 
    pvr_csb_pack (stream_ptr, CR_ISP_CTL, value) {
-      value.sample_pos = true;
       /* Clear-with-no-geometry: upstream sets process_empty_tiles=true for
        * clear sub-commands (pvr_arch_cmd_buffer.c:1698). With zero prims,
-       * false makes the ISP skip every tile -> EOT never writes -> zero RT. */
+       * false makes the ISP skip every tile -> EOT never writes -> zero RT.
+       * sample_pos + skip_init_hdrs gated on multicore: BXM-4-64 MC1 reports
+       * gpu_multicore_support=1; mesa's feature table may say 0. Always set
+       * sample_pos to be safe (TQ path uses simpler setup). */
+      value.sample_pos = true;
       value.process_empty_tiles = true;
-      if (multicore)
-         value.skip_init_hdrs = true;
+      value.skip_init_hdrs = true;
    }
    /* Tiles-in-flight bits live in CR_ISP_CTL [TQ-path pattern]. */
    *stream_ptr |= isp_tiles_in_flight;
@@ -1562,20 +1559,19 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    }
    stream_ptr += pvr_cmd_length(CR_EVENT_PIXEL_PDS_CODE);
 
-   if (multicore) {
-      *stream_ptr = 0; /* isp_oclqry_stride */
-      stream_ptr++;
-   }
-
+   /* Multicore struts — always write (BXM-4-64 MC1 reports multicore=1, but
+    * mesa's feature table may say 0; the kernel parse needs the full layout
+    * for the 4 u32 tail: oclqry_stride / zls_stride / sls_stride / execute_count
+    * all zero). TQ path skips these but its transfer-frag stream layout is
+    * different — render path needs them to match the kernel's stream defs. */
+   *stream_ptr = 0; /* isp_oclqry_stride */
+   stream_ptr++;
    *stream_ptr = 0; /* zls_stride */
    stream_ptr++;
    *stream_ptr = 0; /* sls_stride */
    stream_ptr++;
-
-   if (multicore) {
-      *stream_ptr = 0; /* execute_count */
-      stream_ptr++;
-   }
+   *stream_ptr = 0; /* execute_count */
+   stream_ptr++;
 
    state->fw_stream_len = (uint8_t *)stream_ptr - (uint8_t *)state->fw_stream;
    assert(state->fw_stream_len <= ARRAY_SIZE(state->fw_stream));
