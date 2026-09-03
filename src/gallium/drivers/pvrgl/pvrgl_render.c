@@ -1394,11 +1394,18 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
                code_off = ALIGN_POT(event_program.data_size * 4,
                                       ROGUE_CR_EVENT_PIXEL_PDS_CODE_ADDR_ALIGNMENT);
 
-               /* DOUTU execution_address = code segment start (heap_offset + code_off),
-                * NOT the BO base dev_addr. Same as CR_EVENT_PIXEL_PDS_DATA/CODE —
-                * the FW expects heap-relative offsets for these PDS addresses. */
+               /* DOUTU execution_address = the USC EOT program (on the USC
+                * heap), NOT the pixel-event PDS program's code segment.
+                * The DOUTU kicks the USC; the USC expects a USC program,
+                * so pointing it at PDS code makes the USC execute garbage
+                * -> zero RT pixels (the render-path "submit accepted, no
+                * pixels" symptom). The TQ path uses eot_bo->heap_offset
+                * for exactly this field and paints real pixels; the render
+                * path must match. CR_EVENT_PIXEL_PDS_DATA/CODE are separate
+                * fields (below) and DO take heap-relative PDS offsets — do
+                * not conflate the two. */
                pvr_pds_setup_doutu(&event_program.task_control,
-                                     r->event_pds_bo.heap_offset + code_off,
+                                     eot_bo->heap_offset,
                                      eot_temps,
                                      ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE,
                                      false);
