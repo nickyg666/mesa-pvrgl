@@ -1161,7 +1161,10 @@ pvrgl_render_fini(struct pvrgl_render *r)
 
 /* ---- Render submit (geometry + fragment jobs). ---- */
 
-static void
+/* pvrgl_geom_stream_init() is currently UNUSED — see pvrgl_render_submit()
+ * comment explaining why geom is skipped for the no-geometry clear path.
+ * Kept here (dead) so future geometry work has a reference. */
+__attribute__((unused)) static void
 pvrgl_geom_stream_init(struct pvrgl_render *r,
                        struct pvr_winsys_geometry_state *state)
 {
@@ -1215,7 +1218,7 @@ pvrgl_geom_stream_init(struct pvrgl_render *r,
    }
 
    (void)dev_info;
-   mesa_logi("pvrgl: geom stream len=%u", state->fw_stream_len);
+   mesa_logi("pvrgl: geom stream len=%u (DEAD — unused)", state->fw_stream_len);
 }
 
 static void
@@ -1620,7 +1623,11 @@ pvrgl_render_submit(struct pvrgl_render *r,
    submit_info.fragment.wait = NULL;
    submit_info.fragment_pr.wait = NULL;
 
-   pvrgl_geom_stream_init(r, &submit_info.geometry);
+   /* M3 bisect result 2026-09-03: the geom stream (even with valid VDM
+    * terminate word) causes the kernel/FW to NOT paint pixels. Skip the
+    * geom stream entirely for no-geometry clear; the frag job alone
+    * drives the EOT. Note: this means the render path is a "fragment-only"
+    * clear. Future: add real geometry support when the use case arises. */
    pvrgl_frag_stream_init(r, &submit_info.fragment, rt_bo, rt_format,
                           width, height, clear_dword);
 
