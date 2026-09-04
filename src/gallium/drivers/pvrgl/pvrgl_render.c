@@ -1161,10 +1161,13 @@ pvrgl_render_fini(struct pvrgl_render *r)
 
 /* ---- Render submit (geometry + fragment jobs). ---- */
 
-/* pvrgl_geom_stream_init() is currently UNUSED — see pvrgl_render_submit()
- * comment explaining why geom is skipped for the no-geometry clear path.
- * Kept here (dead) so future geometry work has a reference. */
-__attribute__((unused)) static void
+/* M3.5: pvrgl_geom_stream_init() packs the geom FW stream + the VDM
+ * ctrl stream. The M3 fragment-only path skipped geom (commit 4eb65e22)
+ * because the terminate-only VDM caused the EOT PDS event to never fire.
+ * M3.5 step 1: bring the geom stream back. M3.5 step 2 will swap the
+ * terminate-only VDM ctrl stream for a real VDMCTRL_INDEX_LIST0 (3 verts,
+ * no USC) — once we can validate the change on a live board. */
+static void
 pvrgl_geom_stream_init(struct pvrgl_render *r,
                        struct pvr_winsys_geometry_state *state)
 {
@@ -1218,7 +1221,7 @@ pvrgl_geom_stream_init(struct pvrgl_render *r,
    }
 
    (void)dev_info;
-   mesa_logi("pvrgl: geom stream len=%u (DEAD — unused)", state->fw_stream_len);
+   mesa_logi("pvrgl: geom stream len=%u (M3.5: re-enabled — see submit)", state->fw_stream_len);
 }
 
 static void
@@ -1623,11 +1626,20 @@ pvrgl_render_submit(struct pvrgl_render *r,
    submit_info.fragment.wait = NULL;
    submit_info.fragment_pr.wait = NULL;
 
-   /* M3 bisect result 2026-09-03: the geom stream (even with valid VDM
-    * terminate word) causes the kernel/FW to NOT paint pixels. Skip the
-    * geom stream entirely for no-geometry clear; the frag job alone
-    * drives the EOT. Note: this means the render path is a "fragment-only"
-    * clear. Future: add real geometry support when the use case arises. */
+   /* M3.5: opt-in geom stream re-enable. Default (unset) keeps the
+    * M3 fragment-only path that paints pixels (commit 4eb65e22). With
+    * PVRGL_GEOM_STREAM_TEST=1 the geom stream runs alongside the frag
+    * stream — currently using a terminate-only VDM ctrl stream, which
+    * M3 bisect 2026-09-03 showed prevents pixel paint. So this is
+    * essentially a regression test: if it DOES paint, the VDM ctrl
+    * stream layout was the M3 problem, not the geom FW stream itself.
+    * If it still doesn't paint (expected), the issue is deeper in
+    * the VDM/EOT handshake and M3.5 step 2 must replace terminate-only
+    * with a real VDMCTRL_INDEX_LIST0. */
+   if (getenv("PVRGL_GEOM_STREAM_TEST")) {
+      pvrgl_geom_stream_init(r, &submit_info.geometry);
+      mesa_logi("pvrgl: PVRGL_GEOM_STREAM_TEST=1 — geom stream enabled");
+   }
    pvrgl_frag_stream_init(r, &submit_info.fragment, rt_bo, rt_format,
                           width, height, clear_dword);
 
