@@ -1039,13 +1039,59 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
 
    /* ---- Aux BOs (size-independent). ---- */
    {
-      /* M3.5 step 2: 3-DW ctrl stream -- INDEX_LIST0 (TRI_LIST, 3 verts, */
-      /* non-indexed) + INDEX_LIST2 (index_count=3) + STREAM_TERMINATE.  */
-      /* pvr_clear.c:937 packs the same pair for its clear tri-strip.    */
-      /* No INDEX_LIST1 (no index buffer), no PDS -- just a VDM draw    */
-      /* that should tick EOT. If FW needs VDM_STATE0/5 add before LIST0.*/
-      uint32_t ctrl_stream[3];
+      /* M3.5 step 3: 8-DW ctrl stream when PVRGL_GEOM_STREAM_TEST=2;     */
+      /* else step 2's 3-DW path (=1) preserved as a fault reference.    */
+      /* Step3 preamble mirrors pvr_clear.c:889-929 (pack_clear_vdm_state)*/
+      /* pds_data/code base addrs = 0 (no PDS program -- preamble well-   */
+      /* formedness experiment). vs_output_size=0 (TQ handles pixel).    */
+      const struct pvr_device_info *dev_info = screen->dev_info;
+      const char *gs_env = getenv("PVRGL_GEOM_STREAM_TEST");
+      bool step3_preamble = (gs_env && gs_env[0] == '2' && gs_env[1] == '\0');
+      uint32_t ctrl_stream[8];
       uint32_t *cs = ctrl_stream;
+      if (step3_preamble) {
+         const uint32_t vs_output_size_in_bytes = 0;
+         const uint32_t vs_output_size =
+            DIV_ROUND_UP(vs_output_size_in_bytes,
+                         ROGUE_VDMCTRL_VDM_STATE4_VS_OUTPUT_SIZE_UNIT_SIZE);
+         /* Inline cam calc for vs_output_size=0, raster=true. */
+         uint32_t vdm_cam_size =
+            PVR_GET_FEATURE_VALUE(dev_info, vdm_cam_size, 32U);
+         uint32_t cam_size = MIN2(31U, vdm_cam_size - 1U);
+         uint32_t max_instances = 16U;
+         pvr_csb_pack (cs, VDMCTRL_VDM_STATE0, v) {
+            v.vs_data_addr_present = false;
+            v.vs_other_present = false;
+            v.cam_size = cam_size;
+            v.uvs_scratch_size_select =
+               ROGUE_VDMCTRL_UVS_SCRATCH_SIZE_SELECT_FIVE;
+            v.flatshade_control =
+               ROGUE_VDMCTRL_FLATSHADE_CONTROL_VERTEX_0;
+         }
+         cs += pvr_cmd_length(VDMCTRL_VDM_STATE0);
+         pvr_csb_pack (cs, VDMCTRL_VDM_STATE2, v) {
+            v.vs_pds_data_base_addr = PVR_DEV_ADDR(0);
+         }
+         cs += pvr_cmd_length(VDMCTRL_VDM_STATE2);
+         pvr_csb_pack (cs, VDMCTRL_VDM_STATE3, v) {
+            v.vs_pds_code_base_addr = PVR_DEV_ADDR(0);
+         }
+         cs += pvr_cmd_length(VDMCTRL_VDM_STATE3);
+         pvr_csb_pack (cs, VDMCTRL_VDM_STATE4, v) {
+            v.vs_output_size = vs_output_size;
+         }
+         cs += pvr_cmd_length(VDMCTRL_VDM_STATE4);
+         pvr_csb_pack (cs, VDMCTRL_VDM_STATE5, v) {
+            v.vs_max_instances = max_instances;
+            v.vs_usc_unified_size = 0;
+            v.vs_pds_temp_size = 0;
+            v.vs_pds_data_size = 0;
+         }
+         cs += pvr_cmd_length(VDMCTRL_VDM_STATE5);
+      } else {
+      /* M3.5 step 2: 3-DW ctrl stream -- INDEX_LIST0 + INDEX_LIST2 +     */
+      /* STREAM_TERMINATE. No INDEX_LIST1 (no index buffer), no PDS.       */
+      /* Proven-insufficient (FW faults reason=1 dm=2); =1 path preserved.*/
       pvr_csb_pack (cs, VDMCTRL_INDEX_LIST0, v) {
          v.index_count_present = true;
          v.primitive_topology = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_LIST;
@@ -1055,6 +1101,7 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
          v.index_count = 3;
       }
       cs += pvr_cmd_length(VDMCTRL_INDEX_LIST2);
+      }
       pvr_csb_pack (cs, VDMCTRL_STREAM_TERMINATE, v);
       cs += pvr_cmd_length(VDMCTRL_STREAM_TERMINATE);
       vk = pvrgl_upload(screen, screen->heaps->general_heap, ctrl_stream,
