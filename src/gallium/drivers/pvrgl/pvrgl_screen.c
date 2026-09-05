@@ -103,6 +103,16 @@ pvrgl_create_screen(int drm_fd)
       mesa_logi("pvrgl: winsys ready (page=%uK, heaps ok, TQ ctx ok)",
                 (unsigned)(screen->ws->page_size >> 10));
 
+      /* Fence syncobj for TQ/render submissions. drmSyncobjWait() in
+       * pvrgl_flush() blocks until GPU has finished all submitted jobs. */
+      if (drmSyncobjCreate(screen->fd, 0, &screen->fence_syncobj) == 0) {
+         screen->fence_value = 0;
+         mesa_logi("pvrgl: fence syncobj=%u ready", screen->fence_syncobj);
+      } else {
+         mesa_logw("pvrgl: fence syncobj create failed — flush will not wait");
+         screen->fence_syncobj = 0;
+      }
+
       res = pvrgl_tq_init(screen, &screen->tq_priv);
       if (res != VK_SUCCESS) {
          mesa_logw("pvrgl: TQ init failed: %d", res);
@@ -179,6 +189,8 @@ pvrgl_create_screen(int drm_fd)
    return &screen->base;
 
 out_fail_alloc:
+   if (screen->fence_syncobj)
+      drmSyncobjDestroy(screen->fd, screen->fence_syncobj);
    pvrgl_tq_finish(screen, screen->tq_priv);
    if (screen->tctx && screen->ws)
       screen->ws->ops->transfer_ctx_destroy(screen->tctx);
@@ -195,6 +207,8 @@ pvrgl_destroy_screen(struct pipe_screen *pscreen)
    struct pvrgl_screen *screen = (struct pvrgl_screen *)pscreen;
 
    pvrgl_tq_finish(screen, screen->tq_priv);
+   if (screen->fence_syncobj)
+      drmSyncobjDestroy(screen->fd, screen->fence_syncobj);
    if (screen->tctx && screen->ws)
       screen->ws->ops->transfer_ctx_destroy(screen->tctx);
    if (screen->ws)

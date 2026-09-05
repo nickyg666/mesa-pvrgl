@@ -123,11 +123,27 @@ static uint32_t pvr_winsys_transfer_flags_to_drm(
    return flags;
 }
 
+VkResult pvr_drm_winsys_transfer_submit_with_syncobj(
+   const struct pvr_winsys_transfer_ctx *ctx,
+   const struct pvr_winsys_transfer_submit_info *submit_info,
+   UNUSED const struct pvr_device_info *const dev_info,
+   uint32_t signal_syncobj); // fwd-declare for Werror=-Wimplicit-function-declaration
+
 VkResult pvr_drm_winsys_transfer_submit(
    const struct pvr_winsys_transfer_ctx *ctx,
    const struct pvr_winsys_transfer_submit_info *submit_info,
    UNUSED const struct pvr_device_info *const dev_info,
    struct vk_sync *signal_sync)
+{
+   return pvr_drm_winsys_transfer_submit_with_syncobj(
+      ctx, submit_info, dev_info, signal_sync ? vk_sync_as_drm_syncobj(signal_sync)->syncobj : 0);
+}
+
+VkResult pvr_drm_winsys_transfer_submit_with_syncobj(
+   const struct pvr_winsys_transfer_ctx *ctx,
+   const struct pvr_winsys_transfer_submit_info *submit_info,
+   UNUSED const struct pvr_device_info *const dev_info,
+   uint32_t signal_syncobj)
 {
    const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
    const struct pvr_drm_winsys_transfer_ctx *drm_ctx =
@@ -167,10 +183,9 @@ VkResult pvr_drm_winsys_transfer_submit(
       };
    }
 
-   if (signal_sync) {
-      assert(!(signal_sync->flags & VK_SYNC_IS_TIMELINE));
+   if (signal_syncobj) {
       sync_ops[job_args.sync_ops.count++] = (struct drm_pvr_sync_op){
-         .handle = vk_sync_as_drm_syncobj(signal_sync)->syncobj,
+         .handle = signal_syncobj,
          .flags = DRM_PVR_SYNC_OP_FLAG_SIGNAL |
                   DRM_PVR_SYNC_OP_FLAG_HANDLE_TYPE_SYNCOBJ,
          .value = 0,

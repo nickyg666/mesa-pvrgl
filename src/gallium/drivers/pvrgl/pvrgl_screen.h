@@ -38,6 +38,11 @@ struct pvrgl_screen {
    struct pvrgl_render *render_priv;
 
    bool winsys_ok;
+
+   /* Fence syncobj for TQ/render submission completion. drmSyncobjWait()
+    * in pvrgl_flush() blocks until the GPU has finished all submitted jobs. */
+   uint32_t fence_syncobj;
+   uint64_t fence_value;
 };
 
 struct pipe_context *
