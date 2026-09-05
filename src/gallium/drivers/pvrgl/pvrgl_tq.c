@@ -699,9 +699,10 @@ pvrgl_tq_clear_surface(struct pvrgl_screen *screen,
 {
    struct pvrgl_tq *tq = screen->tq_priv;
    const struct pvr_device_info *dev_info = screen->dev_info;
-   const bool sipf = PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format);
    const bool sipf2 =
       PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format_v2);
+   const bool sipf __attribute__((unused)) =
+      PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format);
    struct pvr_winsys_transfer_submit_info submit_info;
    struct pvr_winsys_transfer_cmd *cmd;
    struct pvr_winsys_transfer_regs *regs;
