@@ -1039,10 +1039,26 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
 
    /* ---- Aux BOs (size-independent). ---- */
    {
-      uint32_t terminate;
-      pvr_csb_pack (&terminate, VDMCTRL_STREAM_TERMINATE, x);
-      vk = pvrgl_upload(screen, screen->heaps->general_heap, &terminate,
-                        sizeof(terminate) + 16U, 16U, &r->ctrl_stream_bo);
+      /* M3.5 step 2: 3-DW ctrl stream -- INDEX_LIST0 (TRI_LIST, 3 verts, */
+      /* non-indexed) + INDEX_LIST2 (index_count=3) + STREAM_TERMINATE.  */
+      /* pvr_clear.c:937 packs the same pair for its clear tri-strip.    */
+      /* No INDEX_LIST1 (no index buffer), no PDS -- just a VDM draw    */
+      /* that should tick EOT. If FW needs VDM_STATE0/5 add before LIST0.*/
+      uint32_t ctrl_stream[3];
+      uint32_t *cs = ctrl_stream;
+      pvr_csb_pack (cs, VDMCTRL_INDEX_LIST0, v) {
+         v.index_count_present = true;
+         v.primitive_topology = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_LIST;
+      }
+      cs += pvr_cmd_length(VDMCTRL_INDEX_LIST0);
+      pvr_csb_pack (cs, VDMCTRL_INDEX_LIST2, v) {
+         v.index_count = 3;
+      }
+      cs += pvr_cmd_length(VDMCTRL_INDEX_LIST2);
+      pvr_csb_pack (cs, VDMCTRL_STREAM_TERMINATE, v);
+      cs += pvr_cmd_length(VDMCTRL_STREAM_TERMINATE);
+      vk = pvrgl_upload(screen, screen->heaps->general_heap, ctrl_stream,
+                        sizeof(ctrl_stream) + 16U, 16U, &r->ctrl_stream_bo);
       if (vk != VK_SUCCESS)
          goto err_rctx;
 
