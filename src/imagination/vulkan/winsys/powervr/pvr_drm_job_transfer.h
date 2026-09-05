@@ -42,6 +42,11 @@ VkResult pvr_drm_winsys_transfer_ctx_create(
    const struct pvr_winsys_transfer_ctx_create_info *create_info,
    struct pvr_winsys_transfer_ctx **const ctx_out);
 void pvr_drm_winsys_transfer_ctx_destroy(struct pvr_winsys_transfer_ctx *ctx);
+VkResult pvr_drm_winsys_transfer_submit_with_syncobj(
+   const struct pvr_winsys_transfer_ctx *ctx,
+   const struct pvr_winsys_transfer_submit_info *submit_info,
+   const struct pvr_device_info *const dev_info,
+   uint32_t signal_syncobj);
 VkResult pvr_drm_winsys_transfer_submit(
    const struct pvr_winsys_transfer_ctx *ctx,
    const struct pvr_winsys_transfer_submit_info *submit_info,
