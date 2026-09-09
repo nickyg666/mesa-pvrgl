@@ -1,20 +1,10 @@
 # Copyright © 2022 Imagination Technologies Ltd.
 # SPDX-License-Identifier: MIT
 
-subdir('pds')
-
-pvr_entrypoints = custom_target(
-  'pvr_entrypoints',
-  input : [vk_entrypoints_gen, vk_api_xml],
-  output : ['pvr_entrypoints.h', 'pvr_entrypoints.c'],
-  command : [
-    prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
-    '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'pvr',
-    '--device-prefix', 'pvr_rogue',
-    '--beta', with_vulkan_beta.to_string()
-  ],
-  depend_files : vk_entrypoints_gen_depend_files,
-)
+# Pre-generated pvr_entrypoints from board build — skip generation
+# (vk_entrypoints_gen not available in cross-compile without LLVM)
+pvr_entrypoints = [files('pvr_entrypoints.h'), files('pvr_entrypoints.c')]
+pvr_entrypoints_h = include_directories('.')
 
 pvr_drirc = custom_target(
   'pvr_drirc',

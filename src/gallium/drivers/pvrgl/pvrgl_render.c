@@ -1091,8 +1091,11 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
          cs += pvr_cmd_length(VDMCTRL_VDM_STATE5);
       }
       if (step3_preamble || step2_3dw) {
-      /* M3.5 step 2: 3-DW ctrl stream -- INDEX_LIST0 + INDEX_LIST2 +     */
-      /* STREAM_TERMINATE. No INDEX_LIST1 (no index buffer), no PDS.       */
+      /* M3.5 FIX: 3-DW ctrl stream -- INDEX_LIST0 + INDEX_LIST2 +
+       * STREAM_TERMINATE. No INDEX_LIST1 (no index buffer), no PDS program.
+       * The INDEX_LIST configures the ISP (primitive type, vertex count) so
+       * the FRAGMENT job's PBE can write pixels. Without this, the fragment
+       * job's EOT never fires because the ISP has nothing to do. */
       pvr_csb_pack (cs, VDMCTRL_INDEX_LIST0, v) {
          v.index_count_present = true;
          v.primitive_topology = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_LIST;
@@ -1310,7 +1313,6 @@ pvrgl_frag_stream_init(struct pvrgl_render *r,
    uint32_t code_off = 0;
    uint32_t usc_pixel_output_ctrl = 0;
    uint32_t event_data_size = 0;
-   VkResult vk_frag;
    struct pvr_pbe_surf_params surf_params;
    struct pvr_pbe_render_params render_params;
    uint32_t pbe_words[ROGUE_NUM_PBESTATE_STATE_WORDS];

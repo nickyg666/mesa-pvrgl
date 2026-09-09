@@ -203,6 +203,24 @@ pvrgl_transfer_map(struct pipe_context *pctx,
 }
 
 static void
+pvrgl_buffer_subdata(struct pipe_context *pctx,
+                     struct pipe_resource *pres,
+                     unsigned usage,
+                     unsigned offset,
+                     unsigned size,
+                     const void *data)
+{
+   struct pvrgl_screen *screen = (struct pvrgl_screen *)pctx->screen;
+   struct pvrgl_resource *res = pvrgl_resource(pres);
+   VkResult vk;
+   if (!res->bo->map) {
+      vk = screen->ws->ops->buffer_map(res->bo, NULL);
+      if (vk != VK_SUCCESS) return;
+   }
+   memcpy((uint8_t *)res->bo->map + offset, data, size);
+}
+
+static void
 pvrgl_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptx)
 {
    struct pvrgl_transfer *tx = (struct pvrgl_transfer *)ptx;

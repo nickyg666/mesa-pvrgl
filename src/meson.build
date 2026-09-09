@@ -95,7 +95,10 @@ endif
 if with_gallium_freedreno or with_freedreno_vk or with_tools.contains('freedreno')
   subdir('freedreno')
 endif
+# Visit imagination/ once.  with_imagination_vk and with_gallium_pvrgl may both be
+# true; a single subdir call handles both the vulkan/ and pvrgl/ subtrees.
 if with_imagination_vk or with_tools.contains('imagination') or with_gallium_pvrgl
+  _imagination_visited = true
   subdir('imagination')
 endif
 if with_any_intel

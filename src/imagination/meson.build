@@ -15,6 +15,7 @@ if with_imagination_vk or with_tools.contains('imagination') or with_gallium_pvr
   subdir('common')
   subdir('csbgen')
   subdir('pco')
+  subdir('vulkan/pds')  # shared PDS library; pvrgl needs it without vulkan
 endif
 
 if with_imagination_vk

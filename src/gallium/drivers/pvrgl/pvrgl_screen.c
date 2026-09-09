@@ -147,9 +147,9 @@ pvrgl_create_screen(int drm_fd)
       caps->max_texture_cube_levels = 14;
       caps->max_texture_array_layers = 256;
       caps->max_render_targets = 1;
-      caps->constant_buffer_offset_alignment = 64;
       caps->texture_buffer_offset_alignment = 16;
       caps->max_vertex_streams = 4;
+      caps->constant_buffer_offset_alignment = 64;
    }
    for (unsigned s = 0; s < MESA_SHADER_MESH_STAGES; s++) {
       struct pipe_shader_caps *sc =
@@ -162,6 +162,8 @@ pvrgl_create_screen(int drm_fd)
       sc->max_texture_samplers = 8;
       sc->max_shader_buffers = 0;
       sc->max_sampler_views = 8;
+      if (s == MESA_SHADER_VERTEX) sc->max_inputs = 16; /* vertex attribs */
+      if (s == MESA_SHADER_FRAGMENT) sc->max_outputs = 8; /* varyings in */
       sc->supported_irs = (1 << PIPE_SHADER_IR_NIR);
    }
 

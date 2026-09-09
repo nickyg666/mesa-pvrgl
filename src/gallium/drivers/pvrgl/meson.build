@@ -38,9 +38,15 @@ files_pvrgl_winsys = files(
   '../../../imagination/vulkan/winsys/pvr_winsys_helper.c',
 )
 
+# pvr_entrypoints from pre-generated files (vulkan subdir skipped when vulkan-drivers=empty)
+pvr_entrypoints_files = files(
+  '../../../imagination/vulkan/pvr_entrypoints.h',
+  '../../../imagination/vulkan/pvr_entrypoints.c',
+)
+
 libpvrgl = static_library(
   'pvrgl',
-  [files_pvrgl, files_pvrgl_winsys, pvr_entrypoints[1]],
+  files_pvrgl + files_pvrgl_winsys + pvr_entrypoints_files,
   include_directories : [
     inc_include, inc_src, inc_gallium, inc_gallium_aux,
     inc_imagination,
