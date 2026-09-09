@@ -1090,12 +1090,12 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
          }
          cs += pvr_cmd_length(VDMCTRL_VDM_STATE5);
       }
-      if (step3_preamble || step2_3dw) {
-      /* M3.5 FIX: 3-DW ctrl stream -- INDEX_LIST0 + INDEX_LIST2 +
-       * STREAM_TERMINATE. No INDEX_LIST1 (no index buffer), no PDS program.
+      /* M3.5: 3-DW ctrl stream -- INDEX_LIST0 + INDEX_LIST2 + STREAM_TERMINATE.
        * The INDEX_LIST configures the ISP (primitive type, vertex count) so
        * the FRAGMENT job's PBE can write pixels. Without this, the fragment
-       * job's EOT never fires because the ISP has nothing to do. */
+       * job's EOT never fires because the ISP has nothing to do.
+       * M3.5 step 2: replaced terminate-only VDM ctrl stream with this
+       * index-list path to enable pixel paint. See bafdcfa M3.5 wiring diff. */
       pvr_csb_pack (cs, VDMCTRL_INDEX_LIST0, v) {
          v.index_count_present = true;
          v.primitive_topology = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_LIST;
@@ -1105,7 +1105,6 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
          v.index_count = 3;
       }
       cs += pvr_cmd_length(VDMCTRL_INDEX_LIST2);
-      }
       pvr_csb_pack (cs, VDMCTRL_STREAM_TERMINATE, v);
       cs += pvr_cmd_length(VDMCTRL_STREAM_TERMINATE);
       vk = pvrgl_upload(screen, screen->heaps->general_heap, ctrl_stream,
