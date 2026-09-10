@@ -19,6 +19,8 @@ files_pvrgl = files(
   'pvrgl_tq.c',
   # M3 render path: HWRT dataset + RENDER context + geometry/fragment submit.
   'pvrgl_render.c',
+  # M3.5 step 1: PDS drawindirect program generation test
+  'pvrgl_pds_test.c',
   '../../../imagination/vulkan/pvr_arch_job_common.c',
   '../../../imagination/vulkan/pvr_arch_formats.c',
   '../../../imagination/vulkan/pvr_usc.c',

@@ -1061,8 +1061,11 @@ pvrgl_render_init(struct pvrgl_screen *screen, struct pvrgl_render **out)
          uint32_t cam_size = MIN2(31U, vdm_cam_size - 1U);
          uint32_t max_instances = 16U;
          pvr_csb_pack (cs, VDMCTRL_VDM_STATE0, v) {
-            v.vs_data_addr_present = false;
-            v.vs_other_present = false;
+            /* M3.5 step3 fix: upstream pvr_clear.c:890-891 sets these true.
+             * false = VDM_STATE0 omits VS data addr + other data → ISP has
+             * nothing to do → fragment EOT never fires. */
+            v.vs_data_addr_present = true;
+            v.vs_other_present = true;
             v.cam_size = cam_size;
             v.uvs_scratch_size_select =
                ROGUE_VDMCTRL_UVS_SCRATCH_SIZE_SELECT_FIVE;
